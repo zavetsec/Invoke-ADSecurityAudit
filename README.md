@@ -87,11 +87,14 @@ cd Invoke-ADSecurityAudit
 # Lite mode — prioritizes immediately exploitable attack paths, ~2–5 min
 .\Invoke-ADSecurityAudit.ps1 -LiteMode
 
-# Full audit — 21 checks, complete coverage
+# Full audit — 22 checks, complete coverage
 .\Invoke-ADSecurityAudit.ps1
+
+# Running from a non-domain machine or as a local account
+.\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local -Credential (Get-Credential)
 ```
 
-The HTML report opens automatically on completion.
+The HTML report saves to the script directory automatically on completion.
 
 ---
 
@@ -115,7 +118,7 @@ Real example from a typical enterprise environment:
                   rotate password to 25+ chars; consider migrating to gMSA
 ```
 
-This is one finding out of 21 checks. The HTML report presents all findings with the same level of detail, filterable by severity, category, and keyword.
+This is one finding out of 22 checks. The HTML report presents all findings with the same level of detail, filterable by severity, category, and keyword.
 
 ---
 
@@ -137,50 +140,80 @@ Add-WindowsFeature RSAT-AD-PowerShell
 Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools
 ```
 
+**Optional — for Check 15 (GPO enumeration via GPMC):**
+
+```powershell
+# Windows Server
+Add-WindowsFeature GPMC
+
+# Windows 10/11
+Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0
+```
+
+> Check 15 is the only check requiring GPMC. If absent, it is silently skipped. Check 22 (GPO security settings via SYSVOL) covers the most critical GPO misconfigurations without any additional modules.
+
 ---
 
 ## Features
 
-- **21 security checks** covering the most common AD attack vectors
+- **22 security checks** covering the most common AD attack vectors
 - **Lite mode** (`-LiteMode`) — prioritizes immediately exploitable attack paths, designed for large domains (10k+ objects), ~2–5 min runtime
+- **GPO security analysis** — reads GPO settings directly from SYSVOL without GPMC: WDigest, NTLMv1, SMB signing, Defender, Firewall, AutoRun, SeDebugPrivilege (Check 22)
 - **Risk score** — simple, explainable prioritization model (`CRITICAL×10 + HIGH×5 + MEDIUM×2 + LOW×1`), designed to focus remediation effort where it matters most
 - **Read-only** — no changes to AD, no remote execution, no writes of any kind
 - **No agent, no install** — standard RSAT `ActiveDirectory` module only
-- **Self-contained HTML report** — dark-themed, filterable/sortable table with severity badges and MITRE ATT&CK TTP references
-- **CSV export** — structured findings for SIEM ingestion or ticketing
+- **Runs from any domain machine** — or from non-domain machines via `-Server` + `-Credential`
+- **Self-contained HTML report** — dark-themed, filterable table with severity badges and MITRE ATT&CK TTP references, saves to script directory
+- **Full data in CSV** — complete object lists, no truncation; HTML shows first 100 per finding with note to check CSV for full list
 - **MITRE ATT&CK mapping** — all checks mapped to relevant techniques where applicable
 
 ---
 
 ## Checks
 
-### Full mode — 21 checks
+### Full mode — 22 checks
 
 All checks are mapped to MITRE ATT&CK techniques where applicable.
 
-| # | Check | Severity | MITRE TTP |
-|---|-------|----------|-----------|
-| 1 | Domain / Forest Functional Level | HIGH | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) |
-| 2 | Privileged group membership (DA, EA, SA, BA + 6 more) | CRITICAL–MEDIUM | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) |
-| 3 | KRBTGT password age — Golden Ticket risk | CRITICAL–MEDIUM | [T1558.001](https://attack.mitre.org/techniques/T1558/001/) |
-| 4 | Default Domain Password Policy + Fine-Grained Policies | CRITICAL–MEDIUM | — |
-| 5 | Kerberoastable accounts (SPN + weak encryption) | CRITICAL–MEDIUM | [T1558.003](https://attack.mitre.org/techniques/T1558/003/) |
-| 6 | AS-REP Roastable accounts (pre-auth disabled) | CRITICAL–HIGH | [T1558.004](https://attack.mitre.org/techniques/T1558/004/) |
-| 7 | Unconstrained + constrained delegation with protocol transition | CRITICAL–HIGH | [T1558](https://attack.mitre.org/techniques/T1558/) |
-| 8 | AdminSDHolder orphans (AdminCount=1 outside priv groups) | HIGH | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) |
-| 9 | DCSync rights — replication ACEs on domain root | CRITICAL | [T1003.006](https://attack.mitre.org/techniques/T1003/006/) |
-| 10 | Stale and never-logged-on user accounts | HIGH–LOW | [T1078](https://attack.mitre.org/techniques/T1078/) |
-| 11 | Password flags (NeverExpires, reversible encryption, DES-only) | CRITICAL–HIGH | [T1078](https://attack.mitre.org/techniques/T1078/) |
-| 12 | LAPS deployment coverage | HIGH–MEDIUM | — |
-| 13 | Stale computer accounts + end-of-life operating systems | CRITICAL–LOW | — |
-| 14 | Domain trust issues (SID filtering, selective auth) | CRITICAL–MEDIUM | — |
-| 15 | GPO issues (disabled settings, unlinked GPOs) | LOW | — |
-| 16 | Protected Users group coverage for privileged accounts | HIGH | — |
-| 17 | Sensitive delegation flag missing on privileged accounts | HIGH | — |
-| 18 | SIDHistory on user and computer accounts | CRITICAL–MEDIUM | [T1134.005](https://attack.mitre.org/techniques/T1134/005/) |
-| 19 | GPP passwords in SYSVOL (`cpassword` / Groups.xml) | CRITICAL | [T1552.006](https://attack.mitre.org/techniques/T1552/006/) |
-| 20 | MachineAccountQuota > 0 — RBCD attack surface | HIGH–MEDIUM | [T1136.002](https://attack.mitre.org/techniques/T1136/002/) |
-| 21 | ACL anomalies on domain root, AdminSDHolder, DC OU, privileged objects | CRITICAL | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) |
+| # | Check | Severity | MITRE TTP | Notes |
+|---|-------|----------|-----------|-------|
+| 1 | Domain / Forest Functional Level | HIGH | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) | |
+| 2 | Privileged group membership (DA, EA, SA, BA + 6 more) | CRITICAL–MEDIUM | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) | |
+| 3 | KRBTGT password age — Golden Ticket risk | CRITICAL–MEDIUM | [T1558.001](https://attack.mitre.org/techniques/T1558/001/) | |
+| 4 | Default Domain Password Policy + Fine-Grained Policies | CRITICAL–MEDIUM | — | |
+| 5 | Kerberoastable accounts (SPN + AdminCount + password age) | CRITICAL–MEDIUM | [T1558.003](https://attack.mitre.org/techniques/T1558/003/) | |
+| 6 | AS-REP Roastable accounts (pre-auth disabled) | CRITICAL–HIGH | [T1558.004](https://attack.mitre.org/techniques/T1558/004/) | |
+| 7 | Unconstrained + constrained delegation with protocol transition | CRITICAL–HIGH | [T1558](https://attack.mitre.org/techniques/T1558/) | |
+| 8 | AdminSDHolder orphans (AdminCount=1 outside priv groups) | HIGH | [T1078.002](https://attack.mitre.org/techniques/T1078/002/) | |
+| 9 | DCSync rights — replication ACEs on domain root | CRITICAL | [T1003.006](https://attack.mitre.org/techniques/T1003/006/) | Requires DA |
+| 10 | Stale and never-logged-on user accounts | HIGH–LOW | [T1078](https://attack.mitre.org/techniques/T1078/) | |
+| 11 | Password flags (NeverExpires, reversible encryption, DES-only) | CRITICAL–HIGH | [T1078](https://attack.mitre.org/techniques/T1078/) | |
+| 12 | LAPS deployment coverage | HIGH–MEDIUM | — | Requires `-CheckLAPS` |
+| 13 | Stale computer accounts + end-of-life operating systems | CRITICAL–LOW | — | |
+| 14 | Domain trust issues (SID filtering, selective auth) | CRITICAL–MEDIUM | — | |
+| 15 | GPO enumeration (disabled, unlinked GPOs) | LOW | — | Requires GPMC |
+| 16 | Protected Users group coverage for privileged accounts | HIGH | — | |
+| 17 | Sensitive delegation flag missing on privileged accounts | HIGH | — | |
+| 18 | SIDHistory on user and computer accounts | CRITICAL–MEDIUM | [T1134.005](https://attack.mitre.org/techniques/T1134/005/) | |
+| 19 | GPP passwords in SYSVOL (`cpassword` / Groups.xml) | CRITICAL | [T1552.006](https://attack.mitre.org/techniques/T1552/006/) | |
+| 20 | MachineAccountQuota > 0 — RBCD attack surface | HIGH–MEDIUM | [T1136.002](https://attack.mitre.org/techniques/T1136/002/) | |
+| 21 | ACL anomalies on domain root, AdminSDHolder, DC OU, privileged objects | CRITICAL | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) | Requires DA |
+| 22 | GPO security settings via SYSVOL (no GPMC required) | CRITICAL–MEDIUM | Multiple | |
+
+**Check 22 — GPO security settings** scans every GPO in SYSVOL directly (no GPMC needed) for:
+
+| Setting | Risk | MITRE |
+|---------|------|-------|
+| WDigest enabled (`UseLogonCredential=1`) | Plaintext passwords in LSASS — Mimikatz target | [T1003.001](https://attack.mitre.org/techniques/T1003/001/) |
+| NTLMv1 allowed (`LmCompatibilityLevel < 3`) | Relay and offline cracking attacks | [T1557.001](https://attack.mitre.org/techniques/T1557/001/) |
+| LM hash storage enabled (`NoLMHash=0`) | Weak hashes trivially cracked | [T1110.002](https://attack.mitre.org/techniques/T1110/002/) |
+| SMB client/server signing disabled | NTLM relay / SMB relay attacks | [T1557.001](https://attack.mitre.org/techniques/T1557/001/) |
+| Windows Firewall disabled | No host-based network filtering | — |
+| Windows Defender disabled | No endpoint malware protection | — |
+| Anonymous access enabled (`RestrictAnonymous=0`) | Unauthenticated enumeration | [T1135](https://attack.mitre.org/techniques/T1135/) |
+| SeDebugPrivilege granted to non-admins | LSASS memory read, process injection | [T1134.001](https://attack.mitre.org/techniques/T1134/001/) |
+| AutoRun not fully disabled | Malicious USB/media execution | — |
+| PowerShell Unrestricted/Bypass | Unsigned script execution domain-wide | — |
 
 ### Lite mode — 9 checks
 
@@ -191,32 +224,40 @@ Checks **2, 3, 5, 6, 7, 9, 19, 20, 21** — Golden Ticket, Kerberoasting, AS-REP
 ## Usage
 
 ```powershell
-# Full audit — PDC Emulator, report to Desktop
+# Full audit — auto-detect PDC, report saved to script directory
 .\Invoke-ADSecurityAudit.ps1
 
-# Lite mode — prioritized critical checks
+# Lite mode — 9 critical checks only
 .\Invoke-ADSecurityAudit.ps1 -LiteMode
 
-# Target a specific DC
+# Specify a DC explicitly (required when running from non-domain machine)
 .\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local
 
-# Custom stale threshold + specific output path
-.\Invoke-ADSecurityAudit.ps1 -StaleAccountDays 60 -OutputPath C:\Reports\ad_audit.html
+# With explicit credentials (non-domain machine or local account)
+.\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local -Credential (Get-Credential)
 
-# Lite mode on large domain
-.\Invoke-ADSecurityAudit.ps1 -LiteMode -Server dc01.corp.local -OutputPath C:\Reports\lite.html
+# Include LAPS coverage check (slow on large domains — 27k+ computers)
+.\Invoke-ADSecurityAudit.ps1 -CheckLAPS
+
+# Custom stale threshold
+.\Invoke-ADSecurityAudit.ps1 -StaleAccountDays 60 -StaleComputerDays 60
+
+# Save reports to a custom path
+.\Invoke-ADSecurityAudit.ps1 -OutputPath C:\Reports\ad_audit.html -CsvPath C:\Reports\ad_audit.csv
 ```
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `-Server` | String | PDC Emulator | Domain controller FQDN to query |
-| `-OutputPath` | String | Desktop | Full path for HTML report |
-| `-CsvPath` | String | Desktop | Full path for CSV findings export |
-| `-StaleAccountDays` | Int | 90 | Days without logon to flag user as stale |
-| `-StaleComputerDays` | Int | 90 | Days without logon to flag computer as stale |
+| `-Server` | String | PDC Emulator | Domain controller FQDN or IP to query |
+| `-Credential` | PSCredential | Current user | Explicit credentials for non-domain or cross-domain runs |
+| `-OutputPath` | String | Script directory | Full path for HTML report |
+| `-CsvPath` | String | Script directory | Full path for CSV findings export |
+| `-StaleAccountDays` | Int | 90 | Days without logon to flag user account as stale |
+| `-StaleComputerDays` | Int | 90 | Days without logon to flag computer account as stale |
 | `-LiteMode` | Switch | Off | Run 9 critical checks only |
+| `-CheckLAPS` | Switch | Off | Include LAPS deployment coverage check (Check 12) |
 
 ---
 
@@ -231,13 +272,15 @@ Checks **2, 3, 5, 6, 7, 9, 19, 20, 21** — Golden Ticket, Kerberoasting, AS-REP
 
 All queries use server-side LDAP filtering. Runtime depends on DC hardware, network latency, GPO/OU complexity, and group nesting depth.
 
+> **Note on LAPS check (`-CheckLAPS`):** enumerates all Windows computer objects with LDAP. On domains with 27k+ computers this adds ~5–10 minutes and may cause temporary high load on the query. Disabled by default.
+
 ---
 
 ## Output
 
 ### HTML report — single self-contained file
 
-No external dependencies. Works fully offline.
+Saved to the script directory by default. No external dependencies. Works fully offline.
 
 - Risk level banner with risk score
 - Severity stat badges (CRITICAL / HIGH / MEDIUM / LOW / total)
@@ -246,10 +289,11 @@ No external dependencies. Works fully offline.
 - Full findings table: severity badge, category, MITRE TTP, check name, description, affected objects, evidence, remediation
 - Quick-filter buttons: CRITICAL, HIGH, Kerberos, Password, Privileged
 - Free-text search across all fields
+- Long object lists truncated to 100 in HTML — full data always in CSV
 
 ### CSV export
 
-All findings in structured CSV: `Time, Category, Severity, Check, TTP, Description, AffectedObjects, Evidence, Recommendation`
+All findings in structured CSV, no truncation: `Time, Category, Severity, Check, TTP, Description, AffectedObjects, Evidence, Recommendation`
 
 ---
 
@@ -257,20 +301,22 @@ All findings in structured CSV: `Time, Category, Severity, Check, TTP, Descripti
 
 The script is **100% read-only**. It generates standard LDAP queries comparable to normal workstation domain activity. No `Set-AD*`, `New-AD*`, or `Remove-AD*` operations are used anywhere.
 
-- **Negligible load:** single-object lookups (KRBTGT, domain root, MAQ, SYSVOL file reads)
-- **Moderate load:** filtered user/computer enumeration — Full mode only, checks 10–13
-- **ACL reads:** `Get-ACL` on up to ~13 specific DN paths (check 21)
+- **Negligible load:** single-object lookups (KRBTGT, domain root, MAQ)
+- **Light load:** SYSVOL file reads for GPP and GPO settings (Checks 19, 22)
+- **Moderate load:** filtered user/computer enumeration — Full mode only, Checks 10–13
+- **ACL reads:** `Get-ACL` on up to ~13 specific DN paths (Checks 9, 21)
 
-Safe to run during business hours. For very large domains in Full mode, off-peak is still recommended.
+Safe to run during business hours. For very large domains in Full mode, off-peak is recommended.
 
 ---
 
 ## Notes
 
 - `LastLogonDate` is replicated on a best-effort basis (~14-day cycle). Accounts may appear stale even if recently active on a different DC.
-- Checks 9 and 21 require elevated AD read permissions. Without them both skip gracefully with a warning.
-- Check 15 (GPO) requires the Group Policy Management Console (GPMC) module. Skipped with a warning if absent.
-- LAPS check uses legacy `ms-Mcs-AdmPwdExpirationTime`. Windows LAPS (2023+) uses a different schema attribute — extend if needed.
+- Checks 9 and 21 (DCSync rights, ACL anomalies) require Domain Admin or equivalent. Without sufficient rights both skip gracefully with a console warning.
+- Check 15 (GPO enumeration) requires the GPMC PowerShell module. Skipped silently if absent — Check 22 covers critical settings without it.
+- LAPS check (12) uses legacy `ms-Mcs-AdmPwdExpirationTime`. Windows LAPS (2023+) stores the password under a different attribute — extend if needed.
+- DCSync and ACL checks correctly filter out built-in legitimate principals, including their Russian-language names on Russian-locale Windows installations.
 
 ---
 
