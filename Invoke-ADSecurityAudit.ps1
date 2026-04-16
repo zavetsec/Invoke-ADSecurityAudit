@@ -377,9 +377,9 @@ try {
 Write-Section "Check 5 - Kerberoastable Accounts (SPNs)"
 
 try {
-    $kerbAccounts = Get-ADUser -Filter { ServicePrincipalName -ne '$null' -and Enabled -eq $true } `
+    $kerbAccounts = @(Get-ADUser -Filter { ServicePrincipalName -ne '$null' -and Enabled -eq $true } `
         -Properties ServicePrincipalName,PasswordLastSet,LastLogonDate,AdminCount,Description @adParams -EA Stop |
-        Where-Object { $_.SamAccountName -ne 'krbtgt' }
+        Where-Object { $_.SamAccountName -ne 'krbtgt' })
 
     if ($kerbAccounts) {
         foreach ($acct in $kerbAccounts) {
@@ -407,8 +407,8 @@ try {
 Write-Section "Check 6 - AS-REP Roastable Accounts (PreAuth disabled)"
 
 try {
-    $asrepAccounts = Get-ADUser -Filter { DoesNotRequirePreAuth -eq $true -and Enabled -eq $true } `
-        -Properties DoesNotRequirePreAuth,PasswordLastSet,LastLogonDate,AdminCount @adParams -EA Stop
+    $asrepAccounts = @(Get-ADUser -Filter { DoesNotRequirePreAuth -eq $true -and Enabled -eq $true } `
+        -Properties DoesNotRequirePreAuth,PasswordLastSet,LastLogonDate,AdminCount @adParams -EA Stop)
 
     if ($asrepAccounts) {
         $names = ($asrepAccounts | Select-Object -ExpandProperty SamAccountName) -join ', '
@@ -431,12 +431,12 @@ Write-Section "Check 7 - Unconstrained Delegation"
 
 try {
     # Accounts with unconstrained delegation (TrustedForDelegation=True)
-    $unconstrAccounts = Get-ADUser -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
-        -Properties TrustedForDelegation,ServicePrincipalName,LastLogonDate @adParams -EA Stop
+    $unconstrAccounts = @(Get-ADUser -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
+        -Properties TrustedForDelegation,ServicePrincipalName,LastLogonDate @adParams -EA Stop)
 
-    $unconstrComputers = Get-ADComputer -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
+    $unconstrComputers = @(Get-ADComputer -Filter { TrustedForDelegation -eq $true -and Enabled -eq $true } `
         -Properties TrustedForDelegation,OperatingSystem @adParams -EA Stop |
-        Where-Object { $_.DistinguishedName -notmatch 'Domain Controllers' }
+        Where-Object { $_.DistinguishedName -notmatch 'Domain Controllers' })
 
     if ($unconstrAccounts) {
         $names = ($unconstrAccounts | Select-Object -ExpandProperty SamAccountName) -join ', '
@@ -463,8 +463,8 @@ try {
 
 # Constrained delegation with protocol transition (Any auth)
 try {
-    $protoTransition = Get-ADUser -Filter { TrustedToAuthForDelegation -eq $true -and Enabled -eq $true } `
-        -Properties TrustedToAuthForDelegation @adParams -EA Stop
+    $protoTransition = @(Get-ADUser -Filter { TrustedToAuthForDelegation -eq $true -and Enabled -eq $true } `
+        -Properties TrustedToAuthForDelegation @adParams -EA Stop)
     if ($protoTransition) {
         $names = ($protoTransition | Select-Object -ExpandProperty SamAccountName) -join ', '
         Add-Finding -Category 'Delegation' -Severity 'HIGH' -TTP 'T1558' `
@@ -483,8 +483,8 @@ if (-not $LiteMode) {
 Write-Section "Check 8 - AdminSDHolder / AdminCount Anomalies"
 
 try {
-    $adminCountUsers = Get-ADUser -Filter { AdminCount -eq 1 -and Enabled -eq $true } `
-        -Properties AdminCount,MemberOf,LastLogonDate,PasswordLastSet @adParams -EA Stop
+    $adminCountUsers = @(Get-ADUser -Filter { AdminCount -eq 1 -and Enabled -eq $true } `
+        -Properties AdminCount,MemberOf,LastLogonDate,PasswordLastSet @adParams -EA Stop)
 
     $orphanAdmin = $adminCountUsers | Where-Object {
         $sam = $_.SamAccountName
@@ -512,10 +512,12 @@ Write-Section "Check 9 - DCSync Capable Accounts"
 
 try {
     $domainACL = Get-ACL "AD:\$domainDN" -EA Stop
-    $dcSyncRights = @(
-        'DS-Replication-Get-Changes',
-        'DS-Replication-Get-Changes-All',
-        'DS-Replication-Get-Changes-In-Filtered-Set'
+
+    # GUIDs for DS-Replication-Get-Changes, DS-Replication-Get-Changes-All, DS-Replication-Get-Changes-In-Filtered-Set
+    $dcSyncGuids = @(
+        '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',
+        '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',
+        '89e95b76-444d-4c62-991a-0facbeda640c'
     )
 
     $dcSyncAccounts = @()
@@ -523,17 +525,9 @@ try {
         if ($ace.ActiveDirectoryRights -match 'ExtendedRight' -and
             $ace.AccessControlType -eq 'Allow' -and
             $ace.IdentityReference -notmatch '(Domain Controllers|Enterprise Domain Controllers|SYSTEM|Domain Admins|Enterprise Admins|Administrators)') {
-            foreach ($right in $dcSyncRights) {
-                if ($ace.ObjectType.ToString() -eq (
-                    [System.DirectoryServices.ActiveDirectory.ActiveDirectorySecurity]::new().GetType().Assembly.GetType('System.DirectoryServices.ActiveDirectory.ActiveDirectorySecurity'))) {
-                    break
-                }
-            }
-            # Check GUID for DS-Replication-Get-Changes-All: {1131f6ad-...}
+
             $guidStr = $ace.ObjectType.ToString().ToLower()
-            if ($guidStr -in @('1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',
-                               '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',
-                               '89e95b76-444d-4c62-991a-0facbeda640c')) {
+            if ($guidStr -in $dcSyncGuids) {
                 $dcSyncAccounts += $ace.IdentityReference.ToString()
             }
         }
@@ -564,13 +558,13 @@ if (-not $LiteMode) {
 Write-Section "Check 10 - Stale User Accounts"
 
 try {
-    $staleEnabled = Get-ADUser -Filter { Enabled -eq $true -and LastLogonDate -lt $staleDate } `
+    $staleEnabled = @(Get-ADUser -Filter { Enabled -eq $true -and LastLogonDate -lt $staleDate } `
         -Properties LastLogonDate,PasswordLastSet,Description,MemberOf @adParams -EA Stop |
-        Where-Object { $_.LastLogonDate -ne $null }
+        Where-Object { $_.LastLogonDate -ne $null })
 
-    $neverLoggedOn = Get-ADUser -Filter { Enabled -eq $true -and LastLogonDate -notlike '*' } `
+    $neverLoggedOn = @(Get-ADUser -Filter { Enabled -eq $true -and LastLogonDate -notlike '*' } `
         -Properties LastLogonDate,PasswordLastSet,WhenCreated @adParams -EA Stop |
-        Where-Object { $_.WhenCreated -lt (Get-Date).AddDays(-30) -and $_.LastLogonDate -eq $null }
+        Where-Object { $_.WhenCreated -lt (Get-Date).AddDays(-30) -and $_.LastLogonDate -eq $null })
 
     if ($staleEnabled.Count -gt 0) {
         $names = ($staleEnabled | Sort-Object LastLogonDate | Select-Object -First 20 |
@@ -603,12 +597,12 @@ try {
 Write-Section "Check 11 - Account Password Flags"
 
 try {
-    $pwdNeverExp = Get-ADUser -Filter { PasswordNeverExpires -eq $true -and Enabled -eq $true } `
-        -Properties PasswordNeverExpires,PasswordLastSet,LastLogonDate,Description @adParams -EA Stop
+    $pwdNeverExp = @(Get-ADUser -Filter { PasswordNeverExpires -eq $true -and Enabled -eq $true } `
+        -Properties PasswordNeverExpires,PasswordLastSet,LastLogonDate,Description @adParams -EA Stop)
 
     if ($pwdNeverExp.Count -gt 0) {
-        $privNeverExp = $pwdNeverExp | Where-Object { $allPrivUsers.ContainsKey($_.SamAccountName) }
-        $regNeverExp  = $pwdNeverExp | Where-Object { -not $allPrivUsers.ContainsKey($_.SamAccountName) }
+        $privNeverExp = @($pwdNeverExp | Where-Object { $allPrivUsers.ContainsKey($_.SamAccountName) })
+        $regNeverExp  = @($pwdNeverExp | Where-Object { -not $allPrivUsers.ContainsKey($_.SamAccountName) })
 
         if ($privNeverExp.Count -gt 0) {
             $names = ($privNeverExp | Select-Object -ExpandProperty SamAccountName) -join ', '
@@ -633,8 +627,8 @@ try {
         Write-Info "No accounts with PasswordNeverExpires found - OK"
     }
 
-    $revEncUsers = Get-ADUser -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } `
-        -Properties AllowReversiblePasswordEncryption @adParams -EA Stop
+    $revEncUsers = @(Get-ADUser -Filter { AllowReversiblePasswordEncryption -eq $true -and Enabled -eq $true } `
+        -Properties AllowReversiblePasswordEncryption @adParams -EA Stop)
     if ($revEncUsers.Count -gt 0) {
         $names = ($revEncUsers | Select-Object -ExpandProperty SamAccountName) -join ', '
         Add-Finding -Category 'Password Policy' -Severity 'CRITICAL' `
@@ -645,8 +639,8 @@ try {
             -Recommendation 'Disable AllowReversiblePasswordEncryption; force password reset for affected accounts'
     }
 
-    $desUsers = Get-ADUser -Filter { UseDESKeyOnly -eq $true -and Enabled -eq $true } `
-        -Properties UseDESKeyOnly @adParams -EA Stop
+    $desUsers = @(Get-ADUser -Filter { UseDESKeyOnly -eq $true -and Enabled -eq $true } `
+        -Properties UseDESKeyOnly @adParams -EA Stop)
     if ($desUsers.Count -gt 0) {
         $names = ($desUsers | Select-Object -ExpandProperty SamAccountName) -join ', '
         Add-Finding -Category 'Kerberos' -Severity 'HIGH' `
@@ -664,8 +658,8 @@ try {
 Write-Section "Check 12 - LAPS (Local Administrator Password Solution)"
 
 try {
-    $computers = Get-ADComputer -Filter { Enabled -eq $true -and OperatingSystem -like '*Windows*' } `
-        -Properties 'ms-Mcs-AdmPwdExpirationTime','OperatingSystem','LastLogonDate' @adParams -EA Stop
+    $computers = @(Get-ADComputer -Filter { Enabled -eq $true -and OperatingSystem -like '*Windows*' } `
+        -Properties 'ms-Mcs-AdmPwdExpirationTime','OperatingSystem','LastLogonDate' @adParams -EA Stop)
 
     $withLAPS    = ($computers | Where-Object { $_.'ms-Mcs-AdmPwdExpirationTime' -ne $null }).Count
     $withoutLAPS = ($computers | Where-Object { $_.'ms-Mcs-AdmPwdExpirationTime' -eq $null }).Count
@@ -698,9 +692,9 @@ try {
 Write-Section "Check 13 - Stale Computer Accounts"
 
 try {
-    $staleComputers = Get-ADComputer -Filter { Enabled -eq $true -and LastLogonDate -lt $staleCompDate } `
+    $staleComputers = @(Get-ADComputer -Filter { Enabled -eq $true -and LastLogonDate -lt $staleCompDate } `
         -Properties LastLogonDate,OperatingSystem,OperatingSystemVersion @adParams -EA Stop |
-        Where-Object { $_.LastLogonDate -ne $null }
+        Where-Object { $_.LastLogonDate -ne $null })
 
     if ($staleComputers.Count -gt 0) {
         $names = ($staleComputers | Sort-Object LastLogonDate | Select-Object -First 20 |
@@ -828,9 +822,9 @@ try {
 Write-Section "Check 17 - Sensitive Account Flags"
 
 try {
-    $noSensFlag = Get-ADUser -Filter { AdminCount -eq 1 -and Enabled -eq $true } `
+    $noSensFlag = @(Get-ADUser -Filter { AdminCount -eq 1 -and Enabled -eq $true } `
         -Properties AccountNotDelegated,AdminCount @adParams -EA Stop |
-        Where-Object { -not $_.AccountNotDelegated }
+        Where-Object { -not $_.AccountNotDelegated })
 
     if ($noSensFlag.Count -gt 0) {
         $names = ($noSensFlag | Select-Object -First 15 | Select-Object -ExpandProperty SamAccountName) -join ', '
@@ -851,11 +845,11 @@ try {
 Write-Section "Check 18 - SIDHistory on Accounts"
 
 try {
-    $sidHistoryUsers = Get-ADUser -Filter { SIDHistory -like '*' } `
-        -Properties SIDHistory,Enabled,LastLogonDate,AdminCount @adParams -EA Stop
+    $sidHistoryUsers = @(Get-ADUser -Filter { SIDHistory -like '*' } `
+        -Properties SIDHistory,Enabled,LastLogonDate,AdminCount @adParams -EA Stop)
 
-    $sidHistoryComps = Get-ADComputer -Filter { SIDHistory -like '*' } `
-        -Properties SIDHistory,Enabled @adParams -EA Stop
+    $sidHistoryComps = @(Get-ADComputer -Filter { SIDHistory -like '*' } `
+        -Properties SIDHistory,Enabled @adParams -EA Stop)
 
     $allSIDH = @()
     foreach ($u in $sidHistoryUsers) {
