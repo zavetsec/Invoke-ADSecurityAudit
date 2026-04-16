@@ -658,8 +658,10 @@ try {
 Write-Section "Check 12 - LAPS (Local Administrator Password Solution)"
 
 try {
+    # Use -ResultPageSize to avoid hanging on large domains with thousands of computers
     $computers = @(Get-ADComputer -Filter { Enabled -eq $true -and OperatingSystem -like '*Windows*' } `
-        -Properties 'ms-Mcs-AdmPwdExpirationTime','OperatingSystem','LastLogonDate' @adParams -EA Stop)
+        -Properties 'ms-Mcs-AdmPwdExpirationTime','OperatingSystem','LastLogonDate' `
+        -ResultPageSize 500 @adParams -EA Stop)
 
     $withLAPS    = ($computers | Where-Object { $_.'ms-Mcs-AdmPwdExpirationTime' -ne $null }).Count
     $withoutLAPS = ($computers | Where-Object { $_.'ms-Mcs-AdmPwdExpirationTime' -eq $null }).Count
@@ -693,7 +695,8 @@ Write-Section "Check 13 - Stale Computer Accounts"
 
 try {
     $staleComputers = @(Get-ADComputer -Filter { Enabled -eq $true -and LastLogonDate -lt $staleCompDate } `
-        -Properties LastLogonDate,OperatingSystem,OperatingSystemVersion @adParams -EA Stop |
+        -Properties LastLogonDate,OperatingSystem,OperatingSystemVersion `
+        -ResultPageSize 500 @adParams -EA Stop |
         Where-Object { $_.LastLogonDate -ne $null })
 
     if ($staleComputers.Count -gt 0) {
@@ -764,6 +767,14 @@ try {
 # -------------------------------------------------------
 Write-Section "Check 15 - Group Policy Security"
 
+if (-not (Get-Module -Name GroupPolicy -ListAvailable)) {
+    Write-Warn "GroupPolicy module (GPMC) not found - Check 15 skipped. Install: Add-WindowsFeature GPMC"
+    Add-Finding -Category 'Group Policy' -Severity 'LOW' `
+        -Check 'GPMC Module Not Available' `
+        -Description 'GroupPolicy PowerShell module not found - GPO security checks could not be performed' `
+        -Evidence 'Module=GroupPolicy Available=False' `
+        -Recommendation 'Install GPMC: Add-WindowsFeature GPMC (Server) or via RSAT on workstation, then re-run'
+} else {
 try {
     $gpos = Get-GPO -All @adParams -EA Stop
 
@@ -790,7 +801,8 @@ try {
     }
 
     Write-Info "Total GPOs: $($gpos.Count)"
-} catch { Write-Warn "Cannot query GPOs (GPMC may be needed): $_" }
+} catch { Write-Warn "Cannot query GPOs: $_" }
+}
 
 # -------------------------------------------------------
 # 16. PROTECTED USERS GROUP CHECK
@@ -798,10 +810,9 @@ try {
 Write-Section "Check 16 - Protected Users Group"
 
 try {
-    $protectedUsers = Get-ADGroupMember -Identity 'Protected Users' @adParams -EA Stop
-    $protectedNames = $protectedUsers | Select-Object -ExpandProperty SamAccountName
-
-    $privNotProtected = $allPrivUsers.Keys | Where-Object { $_ -notin $protectedNames -and $_ -ne 'krbtgt' }
+    $protectedUsers  = @(Get-ADGroupMember -Identity 'Protected Users' @adParams -EA Stop)
+    $protectedNames  = @($protectedUsers | Select-Object -ExpandProperty SamAccountName)
+    $privNotProtected = @($allPrivUsers.Keys | Where-Object { $_ -notin $protectedNames -and $_ -ne 'krbtgt' })
 
     if ($privNotProtected.Count -gt 0) {
         $names = $privNotProtected -join ', '
@@ -1125,11 +1136,17 @@ $html = @"
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#07070e;color:#e2e2e8;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;line-height:1.6}
-header{background:linear-gradient(135deg,#07070e,#0c0c1a);border-bottom:1px solid #181828;padding:22px 40px;display:flex;align-items:center;gap:20px}
-.logo{font-size:24px;font-weight:800;color:#00d4ff;font-family:'Courier New',monospace;letter-spacing:-1px;white-space:nowrap}
-.logo span{color:#ff2d55}.logo em{color:#a78bfa;font-style:normal}
-.hi h1{font-size:16px;font-weight:600}
-.hi p{color:#6e6e80;font-size:11px;margin-top:3px}
+header{background:#0a0a12;border-bottom:1px solid #181828;padding:10px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px}
+.hdr-left{display:flex;flex-direction:column;gap:3px}
+.hdr-title{font-size:15px;font-weight:800;color:#e2e2e8;font-family:'Courier New',monospace;letter-spacing:-0.3px}
+.hdr-title span{color:#00d4ff}
+.hdr-title em{color:#6e6e80;font-style:normal;font-size:12px;font-weight:400;margin-left:6px}
+.hdr-meta{font-size:11px;color:#6e6e80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.hdr-meta .sep{color:#282838}
+.hdr-mode{background:#00d4ff;color:#07070e;font-size:10px;font-weight:700;padding:1px 7px;border-radius:3px;letter-spacing:.4px}
+.hdr-mode.lite{background:#ffd60a;color:#07070e}
+.hdr-right{text-align:right;font-size:11px;color:#00d4ff;font-family:'Courier New',monospace;white-space:nowrap}
+.hdr-right span{display:block;color:#6e6e80;font-size:10px;margin-top:2px}
 .main{padding:26px 40px;max-width:1700px;margin:0 auto}
 .rb{background:#0e0e1a;border:2px solid $riskColor;border-radius:12px;padding:18px 26px;margin-bottom:22px;display:flex;align-items:center;gap:28px}
 .rl{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:1.2px}
@@ -1168,11 +1185,25 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
 </head>
 <body>
 <header>
-  <div class="logo">SOC<span>::</span><em>ADAUDIT</em></div>
-  <div class="hi">
-    <h1>Active Directory Security Audit</h1>
-    <p>Domain: $($domain.DNSRoot) | Forest: $($forest.Name) | PDC: $pdcFQDN | Scan: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | Duration: $duration</p>
+  <div class="hdr-left">
+    <div class="hdr-title">ZavetSec<span>-ADSecurityAudit</span><em>v1.2</em></div>
+    <div class="hdr-meta">
+      <span>Active Directory Security Audit</span>
+      <span class="sep">|</span>
+      <span>Domain: $($domain.DNSRoot)</span>
+      <span class="sep">|</span>
+      <span>PDC: $pdcFQDN</span>
+      <span class="sep">|</span>
+      <span class="hdr-mode$(if($LiteMode){' lite'})">$(if($LiteMode){'LITE'}else{'FULL'})</span>
+      <span class="sep">|</span>
+      <span>Run: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))</span>
+      <span class="sep">|</span>
+      <span>Duration: $duration</span>
+      <span class="sep">|</span>
+      <span>Checks: $(if($LiteMode){9}else{21})</span>
+    </div>
   </div>
+  <div class="hdr-right">github.com/zavetsec<span>MITRE ATT&amp;CK | AD Security</span></div>
 </header>
 <div class="main">
 
