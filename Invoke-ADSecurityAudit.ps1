@@ -1,4 +1,5 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
+# Invoke-ADSecurityAudit v1.2 | Build: FIX-001 | Encoding: UTF8-BOM-CRLF
 <#
 .SYNOPSIS
     Invoke-ADSecurityAudit - Active Directory security audit.
@@ -951,7 +952,7 @@ try {
         $sev = if ($maq -ge 10) { 'HIGH' } else { 'MEDIUM' }
         Add-Finding -Category 'Domain Config' -Severity $sev -TTP 'T1136.002' `
             -Check 'MachineAccountQuota > 0' `
-            -Description "ms-DS-MachineAccountQuota = $maq — any authenticated domain user can add up to $maq computer accounts (enables RBCD/relay attacks)" `
+            -Description "ms-DS-MachineAccountQuota = $maq - any authenticated domain user can add up to $maq computer accounts (enables RBCD/relay attacks)" `
             -AffectedObjects 'Domain root object' `
             -Evidence "ms-DS-MachineAccountQuota=$maq" `
             -Recommendation 'Set ms-DS-MachineAccountQuota to 0 on the domain root: Set-ADDomain -Identity . -Replace @{"ms-DS-MachineAccountQuota"=0}; only admins should join machines to domain'
