@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 # Invoke-ADSecurityAudit v1.2 | Build: FIX-001 | Encoding: UTF8-BOM-CRLF
 <#
 .SYNOPSIS
@@ -41,6 +41,10 @@
     Days since last logon to consider account stale. Default = 90.
 .PARAMETER StaleComputerDays
     Days since computer last logon to flag. Default = 90.
+.PARAMETER CheckLAPS
+    Include LAPS deployment coverage check (Check 12). Disabled by default because it
+    enumerates all Windows computer objects which is slow on large domains (27k+ computers).
+    Use when you specifically need to assess LAPS coverage.
 .PARAMETER LiteMode
     Run only 9 highest-impact checks. Recommended for domains with 10,000+ objects.
     Reduces runtime and DC load significantly. Use for quick triage or scheduled checks.
@@ -59,12 +63,21 @@
 [CmdletBinding()]
 param(
     [string]$Server            = '',
-    [string]$OutputPath        = "$env:USERPROFILE\Desktop\ADSecurityAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').html",
-    [string]$CsvPath           = "$env:USERPROFILE\Desktop\ADSecurityAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv",
+    [string]$OutputPath        = '',
+    [string]$CsvPath           = '',
     [int]   $StaleAccountDays  = 90,
     [int]   $StaleComputerDays = 90,
-    [switch]$LiteMode
+    [switch]$LiteMode,
+    [System.Management.Automation.PSCredential]$Credential = $null,
+    [switch]$CheckLAPS
 )
+
+# Resolve script directory and set default output paths there
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
+$ts = Get-Date -Format 'yyyyMMdd_HHmmss'
+if (-not $OutputPath) { $OutputPath = Join-Path $scriptDir "ADSecurityAudit_$ts.html" }
+if (-not $CsvPath)    { $CsvPath    = Join-Path $scriptDir "ADSecurityAudit_$ts.csv"  }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
@@ -134,19 +147,32 @@ Write-Host "    Invoke-ADSecurityAudit v1.2" -ForegroundColor Cyan
 if ($LiteMode) {
 Write-Host "    MODE: LITE (9 critical checks)" -ForegroundColor Yellow
 } else {
-Write-Host "    MODE: FULL (21 checks)" -ForegroundColor Green
+Write-Host "    MODE: FULL (22 checks)" -ForegroundColor Green
 }
 Write-Host "  =============================================" -ForegroundColor DarkCyan
 
 Test-ADModule
 
-# Resolve DC
+# Build common AD parameters
 $adParams = @{}
-if ($Server) { $adParams['Server'] = $Server }
+if ($Server)     { $adParams['Server']     = $Server }
+if ($Credential) { $adParams['Credential'] = $Credential }
 
 try {
-    $domain   = Get-ADDomain @adParams -EA Stop
-    $forest   = Get-ADForest @adParams -EA Stop
+    # Test basic connectivity first with a simple LDAP ping
+    $domain = Get-ADDomain @adParams -EA Stop
+
+    # Get-ADForest - try multiple approaches for compatibility
+    $forest = $null
+    $forestName = $domain.Forest
+    # Try 1: with -Identity (best when -Server is specified)
+    try { $forest = Get-ADForest -Identity $forestName @adParams -EA Stop } catch {}
+    # Try 2: without -Identity (works when running on domain-joined machine)
+    if (-not $forest) { try { $forest = Get-ADForest @adParams -EA Stop } catch {} }
+    # Try 3: no params at all - rely on current user context
+    if (-not $forest) { try { $forest = Get-ADForest -EA Stop } catch {} }
+    if (-not $forest) { throw "Cannot retrieve forest information for '$forestName'" }
+
     $domainDN = $domain.DistinguishedName
     $pdcFQDN  = $domain.PDCEmulator
 
@@ -161,6 +187,13 @@ try {
     Write-Info "Functional Level: Domain=$($domain.DomainMode) Forest=$($forest.ForestMode)"
 } catch {
     Write-Host "  [ERROR] Cannot connect to Active Directory: $_" -ForegroundColor Red
+    Write-Host "" -ForegroundColor Red
+    Write-Host "  Troubleshooting:" -ForegroundColor Yellow
+    Write-Host "  1. Run from a domain-joined machine or specify -Server dc01.domain.local" -ForegroundColor Yellow
+    Write-Host "  2. If running as local account, use -Credential (Get-Credential)" -ForegroundColor Yellow
+    Write-Host "     Example: .\Invoke-ADSecurityAudit.ps1 -Server dc01.alabuga.local -Credential (Get-Credential)" -ForegroundColor Yellow
+    Write-Host "  3. Check firewall allows LDAP (TCP 389) to the DC" -ForegroundColor Yellow
+    Write-Host "  4. Verify DC FQDN resolves: Resolve-DnsName dc01.alabuga.local" -ForegroundColor Yellow
     exit 1
 }
 
@@ -386,11 +419,16 @@ try {
             $spns       = $acct.ServicePrincipalName -join ' | '
             $pwdAge     = if ($acct.PasswordLastSet) { ((Get-Date) - $acct.PasswordLastSet).Days } else { 999 }
             $isPriv     = $allPrivUsers.ContainsKey($acct.SamAccountName)
-            $sev        = if ($isPriv) { 'CRITICAL' } elseif ($pwdAge -gt 365) { 'HIGH' } else { 'MEDIUM' }
+            $hasAdminCnt= $acct.AdminCount -eq 1
+            $sev        = if ($isPriv) { 'CRITICAL' }
+                          elseif ($hasAdminCnt) { 'HIGH' }
+                          elseif ($pwdAge -gt 365) { 'HIGH' }
+                          else { 'MEDIUM' }
+            $tag        = if ($isPriv) { ' [PRIVILEGED]' } elseif ($hasAdminCnt) { ' [AdminCount=1]' } else { '' }
 
             Add-Finding -Category 'Kerberos' -Severity $sev -TTP 'T1558.003' `
                 -Check 'Kerberoastable Account' `
-                -Description "Account '$($acct.SamAccountName)' has SPN(s) - subject to Kerberoasting$(if($isPriv){' [PRIVILEGED]'})" `
+                -Description "Account '$($acct.SamAccountName)' has SPN(s) - subject to Kerberoasting$tag" `
                 -AffectedObjects $acct.SamAccountName `
                 -Evidence "SPN=$spns PwdAge=${pwdAge}d LastLogon=$($acct.LastLogonDate) AdminCount=$($acct.AdminCount)" `
                 -Recommendation 'Use strong passwords (25+ chars) for service accounts; prefer gMSA; enforce AES-256 encryption on SPNs'
@@ -511,6 +549,12 @@ try {
 Write-Section "Check 9 - DCSync Capable Accounts"
 
 try {
+    # Ensure AD: PSDrive exists - it may not be initialised depending on how the module was loaded
+    if (-not (Get-PSDrive -Name 'AD' -ErrorAction SilentlyContinue)) {
+        New-PSDrive -Name 'AD' -PSProvider ActiveDirectory -Root '' -Server $Server -EA Stop | Out-Null
+        Write-Info "AD: PSDrive created"
+    }
+
     $domainACL = Get-ACL "AD:\$domainDN" -EA Stop
 
     # GUIDs for DS-Replication-Get-Changes, DS-Replication-Get-Changes-All, DS-Replication-Get-Changes-In-Filtered-Set
@@ -524,7 +568,7 @@ try {
     foreach ($ace in $domainACL.Access) {
         if ($ace.ActiveDirectoryRights -match 'ExtendedRight' -and
             $ace.AccessControlType -eq 'Allow' -and
-            $ace.IdentityReference -notmatch '(Domain Controllers|Enterprise Domain Controllers|SYSTEM|Domain Admins|Enterprise Admins|Administrators)') {
+            $ace.IdentityReference -notmatch '(Domain Controllers|Enterprise Domain Controllers|SYSTEM|Domain Admins|Enterprise Admins|Administrators|Контроллеры домена|Администраторы|КОНТРОЛЛЕРЫ ДОМЕНА|NT AUTHORITY\\ENTERPRISE|NT AUTHORITY\\КОНТРОЛЛЕРЫ)') {
 
             $guidStr = $ace.ObjectType.ToString().ToLower()
             if ($guidStr -in $dcSyncGuids) {
@@ -567,7 +611,7 @@ try {
         Where-Object { $_.WhenCreated -lt (Get-Date).AddDays(-30) -and $_.LastLogonDate -eq $null })
 
     if ($staleEnabled.Count -gt 0) {
-        $names = ($staleEnabled | Sort-Object LastLogonDate | Select-Object -First 20 |
+        $names = ($staleEnabled | Sort-Object LastLogonDate |
                   ForEach-Object { "$($_.SamAccountName)($($_.LastLogonDate.ToString('yyyy-MM-dd')))" }) -join ', '
         $sev = if ($staleEnabled.Count -gt 20) { 'HIGH' } else { 'MEDIUM' }
         Add-Finding -Category 'Account Hygiene' -Severity $sev -TTP 'T1078' `
@@ -581,7 +625,7 @@ try {
     }
 
     if ($neverLoggedOn.Count -gt 0) {
-        $names = ($neverLoggedOn | Select-Object -First 20 | ForEach-Object { $_.SamAccountName }) -join ', '
+        $names = ($neverLoggedOn | ForEach-Object { $_.SamAccountName }) -join ', '
         Add-Finding -Category 'Account Hygiene' -Severity 'LOW' `
             -Check 'Accounts Never Logged On' `
             -Description "$($neverLoggedOn.Count) enabled account(s) created 30+ days ago have never logged on" `
@@ -614,7 +658,7 @@ try {
                 -Recommendation 'CRITICAL: Remove PasswordNeverExpires from all privileged accounts; enforce regular rotation'
         }
         if ($regNeverExp.Count -gt 0) {
-            $names = ($regNeverExp | Select-Object -First 20 | Select-Object -ExpandProperty SamAccountName) -join ', '
+            $names = ($regNeverExp | Select-Object -ExpandProperty SamAccountName) -join ', '
             $sev   = if ($regNeverExp.Count -gt 20) { 'HIGH' } else { 'MEDIUM' }
             Add-Finding -Category 'Password Policy' -Severity $sev `
                 -Check 'Accounts with Password Never Expires' `
@@ -653,8 +697,9 @@ try {
 } catch { Write-Warn "Cannot query account flags: $_" }
 
 # -------------------------------------------------------
-# 12. LAPS DEPLOYMENT
+# 12. LAPS DEPLOYMENT  [requires -CheckLAPS switch]
 # -------------------------------------------------------
+if ($CheckLAPS) {
 Write-Section "Check 12 - LAPS (Local Administrator Password Solution)"
 
 try {
@@ -687,6 +732,10 @@ try {
         Write-Info "LAPS deployed on all $totalComp computers - OK"
     }
 } catch { Write-Warn "Cannot query LAPS status (attribute may not exist): $_" }
+} else {
+    Write-Section "Check 12 - LAPS (skipped, use -CheckLAPS to enable)"
+    Write-Info "LAPS check skipped - add -CheckLAPS switch to include"
+}
 
 # -------------------------------------------------------
 # 13. STALE COMPUTER ACCOUNTS
@@ -700,7 +749,7 @@ try {
         Where-Object { $_.LastLogonDate -ne $null })
 
     if ($staleComputers.Count -gt 0) {
-        $names = ($staleComputers | Sort-Object LastLogonDate | Select-Object -First 20 |
+        $names = ($staleComputers | Sort-Object LastLogonDate |
                   ForEach-Object { "$($_.Name)($($_.OperatingSystem))" }) -join ', '
         $sev = if ($staleComputers.Count -gt 20) { 'MEDIUM' } else { 'LOW' }
         Add-Finding -Category 'Account Hygiene' -Severity $sev `
@@ -713,22 +762,28 @@ try {
         Write-Info "No stale computer accounts found - OK"
     }
 
+    # EOL OS check - get all Windows computers independently (not from Check 12 LAPS)
     $eolPatterns = @('Windows XP','Windows 7','Windows 8','Server 2003','Server 2008','Server 2012')
-    $eolComputers = $computers | Where-Object {
+    $allWinComputers = @(Get-ADComputer -Filter { Enabled -eq $true -and OperatingSystem -like '*Windows*' } `
+        -Properties OperatingSystem -ResultPageSize 500 @adParams -EA Stop)
+
+    $eolComputers = @($allWinComputers | Where-Object {
         $os = $_.OperatingSystem
         $match = $false
         foreach ($p in $eolPatterns) { if ($os -match $p) { $match = $true; break } }
         $match
-    }
+    })
     if ($eolComputers.Count -gt 0) {
         $osGroups = $eolComputers | Group-Object OperatingSystem |
             ForEach-Object { "$($_.Name):$($_.Count)" }
         Add-Finding -Category 'Patch Management' -Severity 'CRITICAL' `
             -Check 'End-of-Life OS Computers' `
             -Description "$($eolComputers.Count) computer(s) running EOL/unsupported Windows OS" `
-            -AffectedObjects ($eolComputers | Select-Object -First 15 | Select-Object -ExpandProperty Name) -join ', ' `
+            -AffectedObjects ($eolComputers | Select-Object -ExpandProperty Name) -join ', ' `
             -Evidence "OSBreakdown: $($osGroups -join ' | ')" `
             -Recommendation 'CRITICAL: Upgrade EOL systems immediately; isolate until upgraded; EOL systems have unpatched CVEs'
+    } else {
+        Write-Info "No EOL OS computers found - OK"
     }
 } catch { Write-Warn "Cannot query computer accounts: $_" }
 
@@ -768,12 +823,10 @@ try {
 Write-Section "Check 15 - Group Policy Security"
 
 if (-not (Get-Module -Name GroupPolicy -ListAvailable)) {
-    Write-Warn "GroupPolicy module (GPMC) not found - Check 15 skipped. Install: Add-WindowsFeature GPMC"
-    Add-Finding -Category 'Group Policy' -Severity 'LOW' `
-        -Check 'GPMC Module Not Available' `
-        -Description 'GroupPolicy PowerShell module not found - GPO security checks could not be performed' `
-        -Evidence 'Module=GroupPolicy Available=False' `
-        -Recommendation 'Install GPMC: Add-WindowsFeature GPMC (Server) or via RSAT on workstation, then re-run'
+    Write-Warn "GroupPolicy module (GPMC) not found - Check 15 skipped"
+    Write-Warn "  Install on Windows Server : Add-WindowsFeature GPMC"
+    Write-Warn "  Install on Windows 10/11  : Add-WindowsCapability -Online -Name Rsat.GroupPolicy.Management.Tools~~~~0.0.1.0"
+    Write-Warn "  Note: Check 22 (GPO SYSVOL analysis) runs without GPMC and covers critical settings"
 } else {
 try {
     $gpos = Get-GPO -All @adParams -EA Stop
@@ -795,7 +848,7 @@ try {
         Add-Finding -Category 'Group Policy' -Severity 'LOW' `
             -Check 'Unlinked GPOs' `
             -Description "$($unlinked.Count) GPO(s) exist but are not linked to any OU (attack surface / clutter)" `
-            -AffectedObjects ($unlinked | Select-Object -First 10 | Select-Object -ExpandProperty DisplayName) -join ', ' `
+            -AffectedObjects ($unlinked | Select-Object -ExpandProperty DisplayName) -join ', ' `
             -Evidence "UnlinkedCount=$($unlinked.Count) TotalGPOs=$($gpos.Count)" `
             -Recommendation 'Review and delete unused GPOs; attackers with write access can modify unlinked GPOs then link them'
     }
@@ -838,7 +891,7 @@ try {
         Where-Object { -not $_.AccountNotDelegated })
 
     if ($noSensFlag.Count -gt 0) {
-        $names = ($noSensFlag | Select-Object -First 15 | Select-Object -ExpandProperty SamAccountName) -join ', '
+        $names = ($noSensFlag | Select-Object -ExpandProperty SamAccountName) -join ', '
         Add-Finding -Category 'Privileged Accounts' -Severity 'HIGH' `
             -Check 'Privileged Accounts Missing Not-Delegated Flag' `
             -Description "$($noSensFlag.Count) AdminCount=1 account(s) do not have 'Account is sensitive and cannot be delegated' set" `
@@ -967,9 +1020,287 @@ try {
 } catch { Write-Warn "Cannot query MachineAccountQuota: $_" }
 
 # -------------------------------------------------------
+# 22. GPO SECURITY SETTINGS (SYSVOL XML ANALYSIS)
+# No GPMC module required - reads GptTmpl.inf and Registry.pol XML directly from SYSVOL
+# -------------------------------------------------------
+Write-Section "Check 22 - GPO Security Settings (SYSVOL Analysis)"
+
+try {
+    $sysvolPolicies = "\\$Server\SYSVOL\$($domain.DNSRoot)\Policies"
+
+    if (-not (Test-Path $sysvolPolicies)) {
+        Write-Warn "Cannot access SYSVOL Policies path: $sysvolPolicies"
+    } else {
+        # --- Helper: parse GptTmpl.inf (Security Settings) ---
+        function Get-GptTmplValue {
+            param([string]$FilePath, [string]$Section, [string]$Key)
+            try {
+                $lines = Get-Content $FilePath -ErrorAction Stop
+                $inSection = $false
+                foreach ($line in $lines) {
+                    if ($line -match "^\[$([regex]::Escape($Section))\]") { $inSection = $true; continue }
+                    if ($inSection -and $line -match '^\[') { $inSection = $false }
+                    if ($inSection -and $line -match "^$([regex]::Escape($Key))\s*=\s*(.+)") {
+                        return $Matches[1].Trim()
+                    }
+                }
+            } catch {}
+            return $null
+        }
+
+        # --- Helper: search Registry.xml for a specific value ---
+        function Search-RegistryXml {
+            param([string]$FilePath, [string]$KeyPath, [string]$ValueName)
+            try {
+                [xml]$xml = Get-Content $FilePath -ErrorAction Stop
+                foreach ($reg in $xml.RegistrySettings.Registry) {
+                    if ($reg.Properties.key -like "*$KeyPath*" -and
+                        $reg.Properties.name -eq $ValueName) {
+                        return $reg.Properties.value
+                    }
+                }
+            } catch {}
+            return $null
+        }
+
+        # Collect all GPO GUIDs
+        $gpoGuids = Get-ChildItem -Path $sysvolPolicies -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -match '^\{[0-9A-Fa-f\-]{36}\}$' }
+
+        Write-Info "Scanning $($gpoGuids.Count) GPO(s) in SYSVOL for dangerous settings..."
+
+        # Track findings per setting across all GPOs
+        $wdigestGPOs      = @()
+        $ntlmv1GPOs       = @()
+        $lmHashGPOs       = @()
+        $smbSignGPOs      = @()
+        $smbSignSrvGPOs   = @()
+        $fwDisableGPOs    = @()
+        $defDisableGPOs   = @()
+        $autorunGPOs      = @()
+        $anonAccessGPOs   = @()
+        $psUnrestrictGPOs = @()
+        $seDebugGPOs      = @()
+        $credGuardGPOs    = @()
+
+        foreach ($gpo in $gpoGuids) {
+            $gpoName = $gpo.Name
+
+            # --- GptTmpl.inf paths ---
+            $gptMachineInf = Join-Path $gpo.FullName "Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf"
+            $regXmlMachine = Join-Path $gpo.FullName "Machine\Preferences\Registry\Registry.xml"
+            $regXmlPolFile = Join-Path $gpo.FullName "Machine\registry.pol"
+
+            # 1. LmCompatibilityLevel (NTLMv1 allowed if < 3)
+            if (Test-Path $gptMachineInf) {
+                $lmLevel = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Registry Values' -Key 'MACHINE\System\CurrentControlSet\Control\Lsa\LmCompatibilityLevel'
+                if ($lmLevel -ne $null) {
+                    $val = ($lmLevel -split ',')[-1].Trim()
+                    if ([int]$val -lt 3) { $ntlmv1GPOs += "$gpoName (LmCompatibilityLevel=$val)" }
+                }
+
+                # 2. NoLMHash (LM hash storage)
+                $noLM = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Registry Values' -Key 'MACHINE\System\CurrentControlSet\Control\Lsa\NoLMHash'
+                if ($noLM -ne $null) {
+                    $val = ($noLM -split ',')[-1].Trim()
+                    if ($val -eq '0') { $lmHashGPOs += "$gpoName (NoLMHash=0)" }
+                }
+
+                # 3. SMB client signing (RequireSecuritySignature)
+                $smbClientSign = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Registry Values' -Key 'MACHINE\System\CurrentControlSet\Services\LanmanWorkstation\Parameters\RequireSecuritySignature'
+                if ($smbClientSign -ne $null) {
+                    $val = ($smbClientSign -split ',')[-1].Trim()
+                    if ($val -eq '0') { $smbSignGPOs += "$gpoName (SMB client signing disabled)" }
+                }
+
+                # 4. SMB server signing
+                $smbSrvSign = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Registry Values' -Key 'MACHINE\System\CurrentControlSet\Services\LanmanServer\Parameters\RequireSecuritySignature'
+                if ($smbSrvSign -ne $null) {
+                    $val = ($smbSrvSign -split ',')[-1].Trim()
+                    if ($val -eq '0') { $smbSignSrvGPOs += "$gpoName (SMB server signing disabled)" }
+                }
+
+                # 5. RestrictAnonymous
+                $anonAccess = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Registry Values' -Key 'MACHINE\System\CurrentControlSet\Control\Lsa\RestrictAnonymous'
+                if ($anonAccess -ne $null) {
+                    $val = ($anonAccess -split ',')[-1].Trim()
+                    if ($val -eq '0') { $anonAccessGPOs += "$gpoName (RestrictAnonymous=0)" }
+                }
+
+                # 6. SeDebugPrivilege granted to non-admins
+                $seDebug = Get-GptTmplValue -FilePath $gptMachineInf -Section 'Privilege Rights' -Key 'SeDebugPrivilege'
+                if ($seDebug -ne $null -and $seDebug -match '\S') {
+                    # Flag if anyone other than *S-1-5-32-544 (Administrators) has it
+                    $principals = $seDebug -split ','
+                    $nonAdmin = $principals | Where-Object { $_.Trim() -ne '' -and $_.Trim() -notmatch '^\*S-1-5-32-544$' }
+                    if ($nonAdmin) { $seDebugGPOs += "$gpoName (SeDebugPrivilege granted to: $($nonAdmin -join ', '))" }
+                }
+            }
+
+            # 7. WDigest (Registry.xml preferences)
+            if (Test-Path $regXmlMachine) {
+                $wdigest = Search-RegistryXml -FilePath $regXmlMachine -KeyPath 'WDigest' -ValueName 'UseLogonCredential'
+                if ($wdigest -eq '1') { $wdigestGPOs += $gpoName }
+
+                # 8. AutoRun/AutoPlay
+                $autorun = Search-RegistryXml -FilePath $regXmlMachine -KeyPath 'Explorer' -ValueName 'NoDriveTypeAutoRun'
+                if ($autorun -ne $null -and [int]$autorun -lt 255) { $autorunGPOs += "$gpoName (NoDriveTypeAutoRun=$autorun)" }
+
+                # 9. PowerShell Execution Policy
+                $psPolicy = Search-RegistryXml -FilePath $regXmlMachine -KeyPath 'PowerShell' -ValueName 'ExecutionPolicy'
+                if ($psPolicy -in @('Unrestricted','Bypass')) { $psUnrestrictGPOs += "$gpoName (ExecutionPolicy=$psPolicy)" }
+            }
+
+            # 10. Windows Firewall disabled (check common policy paths)
+            $fwPaths = @(
+                (Join-Path $gpo.FullName "Machine\Microsoft\Windows Firewall\FirewallSettings.ini"),
+                (Join-Path $gpo.FullName "Machine\windowsfirewall.inf")
+            )
+            foreach ($fwPath in $fwPaths) {
+                if (Test-Path $fwPath) {
+                    $fwContent = Get-Content $fwPath -Raw -ErrorAction SilentlyContinue
+                    if ($fwContent -match 'EnableFirewall\s*=\s*0') {
+                        $fwDisableGPOs += $gpoName; break
+                    }
+                }
+            }
+
+            # 11. Defender disabled (check Registry.xml for DisableAntiSpyware / DisableRealtimeMonitoring)
+            if (Test-Path $regXmlMachine) {
+                $defDisable = Search-RegistryXml -FilePath $regXmlMachine -KeyPath 'Windows Defender' -ValueName 'DisableAntiSpyware'
+                if ($defDisable -eq '1') { $defDisableGPOs += "$gpoName (DisableAntiSpyware=1)" }
+                $defRT = Search-RegistryXml -FilePath $regXmlMachine -KeyPath 'Real-Time Protection' -ValueName 'DisableRealtimeMonitoring'
+                if ($defRT -eq '1') { $defDisableGPOs += "$gpoName (DisableRealtimeMonitoring=1)" }
+            }
+        }
+
+        # --- Report findings ---
+        if ($wdigestGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'CRITICAL' -TTP 'T1003.001' `
+                -Check 'WDigest Authentication Enabled via GPO' `
+                -Description "WDigest enabled in $($wdigestGPOs.Count) GPO(s) - plaintext passwords stored in LSASS memory (Mimikatz target)" `
+                -AffectedObjects ($wdigestGPOs -join ', ') `
+                -Evidence "GPOs=$($wdigestGPOs -join ' | ')" `
+                -Recommendation 'Set UseLogonCredential=0 in all affected GPOs; WDigest must be disabled on all domain members to prevent credential theft'
+        }
+
+        if ($ntlmv1GPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'CRITICAL' -TTP 'T1557.001' `
+                -Check 'NTLMv1 Allowed via GPO (LmCompatibilityLevel < 3)' `
+                -Description "NTLMv1 allowed in $($ntlmv1GPOs.Count) GPO(s) - vulnerable to relay and offline cracking attacks" `
+                -AffectedObjects ($ntlmv1GPOs -join ', ') `
+                -Evidence "GPOs=$($ntlmv1GPOs -join ' | ')" `
+                -Recommendation 'Set LmCompatibilityLevel=5 (Send NTLMv2 only, refuse LM/NTLM) in Default Domain Controllers Policy and Default Domain Policy'
+        }
+
+        if ($lmHashGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' -TTP 'T1110.002' `
+                -Check 'LM Hash Storage Enabled via GPO' `
+                -Description "LM hash storage enabled in $($lmHashGPOs.Count) GPO(s) - weak hashes trivially cracked offline" `
+                -AffectedObjects ($lmHashGPOs -join ', ') `
+                -Evidence "GPOs=$($lmHashGPOs -join ' | ')" `
+                -Recommendation 'Set NoLMHash=1 in all affected GPOs; LM hashes should never be stored in modern environments'
+        }
+
+        if ($smbSignGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' -TTP 'T1557.001' `
+                -Check 'SMB Client Signing Disabled via GPO' `
+                -Description "SMB client signing disabled in $($smbSignGPOs.Count) GPO(s) - enables NTLM relay / SMB relay attacks" `
+                -AffectedObjects ($smbSignGPOs -join ', ') `
+                -Evidence "GPOs=$($smbSignGPOs -join ' | ')" `
+                -Recommendation 'Enable RequireSecuritySignature=1 for LanmanWorkstation in all GPOs; prevents MitM relay attacks'
+        }
+
+        if ($smbSignSrvGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' -TTP 'T1557.001' `
+                -Check 'SMB Server Signing Disabled via GPO' `
+                -Description "SMB server signing disabled in $($smbSignSrvGPOs.Count) GPO(s) - enables NTLM relay to SMB shares" `
+                -AffectedObjects ($smbSignSrvGPOs -join ', ') `
+                -Evidence "GPOs=$($smbSignSrvGPOs -join ' | ')" `
+                -Recommendation 'Enable RequireSecuritySignature=1 for LanmanServer in all GPOs'
+        }
+
+        if ($fwDisableGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' `
+                -Check 'Windows Firewall Disabled via GPO' `
+                -Description "Firewall disabled in $($fwDisableGPOs.Count) GPO(s) - no host-based network filtering" `
+                -AffectedObjects ($fwDisableGPOs -join ', ') `
+                -Evidence "GPOs=$($fwDisableGPOs -join ' | ')" `
+                -Recommendation 'Re-enable Windows Firewall in all profiles (Domain/Private/Public) via GPO; never disable without compensating controls'
+        }
+
+        if ($defDisableGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' `
+                -Check 'Windows Defender Disabled via GPO' `
+                -Description "Defender disabled in $($defDisableGPOs.Count) GPO(s) - no endpoint malware protection" `
+                -AffectedObjects ($defDisableGPOs -join ', ') `
+                -Evidence "GPOs=$($defDisableGPOs -join ' | ')" `
+                -Recommendation 'Remove Defender disable settings from GPOs unless a third-party AV is deployed and verified; document exception if third-party AV is in use'
+        }
+
+        if ($anonAccessGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' -TTP 'T1135' `
+                -Check 'Anonymous Access Allowed via GPO (RestrictAnonymous=0)' `
+                -Description "Anonymous access enabled in $($anonAccessGPOs.Count) GPO(s) - unauthenticated enumeration of shares, users and groups possible" `
+                -AffectedObjects ($anonAccessGPOs -join ', ') `
+                -Evidence "GPOs=$($anonAccessGPOs -join ' | ')" `
+                -Recommendation 'Set RestrictAnonymous=1 or 2 in LSA registry settings via GPO'
+        }
+
+        if ($autorunGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'MEDIUM' `
+                -Check 'AutoRun/AutoPlay Not Fully Disabled via GPO' `
+                -Description "AutoRun not fully disabled in $($autorunGPOs.Count) GPO(s) - risk of malicious USB/media execution" `
+                -AffectedObjects ($autorunGPOs -join ', ') `
+                -Evidence "GPOs=$($autorunGPOs -join ' | ')" `
+                -Recommendation 'Set NoDriveTypeAutoRun=255 (0xFF) to disable AutoRun for all drive types'
+        }
+
+        if ($psUnrestrictGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'MEDIUM' `
+                -Check 'PowerShell Execution Policy Weakened via GPO' `
+                -Description "PowerShell set to Unrestricted/Bypass in $($psUnrestrictGPOs.Count) GPO(s) - allows unsigned script execution" `
+                -AffectedObjects ($psUnrestrictGPOs -join ', ') `
+                -Evidence "GPOs=$($psUnrestrictGPOs -join ' | ')" `
+                -Recommendation 'Set ExecutionPolicy to RemoteSigned or AllSigned; Bypass/Unrestricted should never be set domain-wide'
+        }
+
+        if ($seDebugGPOs.Count -gt 0) {
+            Add-Finding -Category 'GPO Security' -Severity 'HIGH' -TTP 'T1134.001' `
+                -Check 'SeDebugPrivilege Granted to Non-Admins via GPO' `
+                -Description "Debug privilege assigned to non-standard principals in $($seDebugGPOs.Count) GPO(s) - allows memory reading of any process including LSASS" `
+                -AffectedObjects ($seDebugGPOs -join ', ') `
+                -Evidence "GPOs=$($seDebugGPOs -join ' | ')" `
+                -Recommendation 'Remove SeDebugPrivilege from all non-administrative accounts; this right should only belong to Administrators'
+        }
+
+        $totalGPOIssues = $wdigestGPOs.Count + $ntlmv1GPOs.Count + $lmHashGPOs.Count +
+                          $smbSignGPOs.Count + $smbSignSrvGPOs.Count + $fwDisableGPOs.Count +
+                          $defDisableGPOs.Count + $anonAccessGPOs.Count + $autorunGPOs.Count +
+                          $psUnrestrictGPOs.Count + $seDebugGPOs.Count
+
+        if ($totalGPOIssues -eq 0) {
+            Write-Info "No dangerous GPO security settings found across $($gpoGuids.Count) GPO(s) - OK"
+        } else {
+            Write-Info "GPO security scan complete: $totalGPOIssues issue(s) found across $($gpoGuids.Count) GPO(s)"
+        }
+    }
+} catch { Write-Warn "GPO security settings scan error: $_" }
+
+# -------------------------------------------------------
 # 21. ACL ANOMALIES ON CRITICAL AD OBJECTS
 # -------------------------------------------------------
 Write-Section "Check 21 - ACL Anomalies on Critical AD Objects"
+
+# Ensure AD: PSDrive exists (needed for Get-ACL "AD:\...")
+if (-not (Get-PSDrive -Name 'AD' -ErrorAction SilentlyContinue)) {
+    try {
+        New-PSDrive -Name 'AD' -PSProvider ActiveDirectory -Root '' -Server $Server -EA Stop | Out-Null
+        Write-Info "AD: PSDrive created for ACL checks"
+    } catch {
+        Write-Warn "Cannot create AD: PSDrive - Check 21 ACL checks will be skipped: $_"
+    }
+}
 
 # Rights that allow takeover / privilege escalation
 $dangerousRights = @(
@@ -1098,14 +1429,26 @@ function Get-SC { param([string]$s)
 $catSummary = $global:Findings | Group-Object Category | Sort-Object Count -Descending
 
 $catRows = ($catSummary | ForEach-Object {
-    $topSev = ($global:Findings | Where-Object { $_.Category -eq $_.Name } |
+    $catName = $_.Name
+    $catCount = $_.Count
+    $topSev = ($global:Findings | Where-Object { $_.Category -eq $catName } |
                Sort-Object @{e={switch($_.Severity){'CRITICAL'{0}'HIGH'{1}'MEDIUM'{2}default{3}}}} |
                Select-Object -First 1).Severity
     $sc = Get-SC $topSev
-    $pct= [Math]::Round($_.Count / $totalCount * 100)
+    $pct= [Math]::Round($catCount / $totalCount * 100)
     $bar= [Math]::Round($pct * 1.5)
-    "<tr><td style='color:#a78bfa;font-size:11px'>$($_.Name)</td><td>$($_.Count)</td><td><div style='background:#181828;border-radius:3px;height:5px;width:150px'><div style='background:$sc;height:5px;border-radius:3px;width:${bar}px'></div></div></td><td><span class='badge' style='background:$sc;font-size:9px'>$topSev</span></td></tr>"
+    "<tr><td style='color:#a78bfa;font-size:11px'>$catName</td><td>$catCount</td><td><div style='background:#181828;border-radius:3px;height:5px;width:150px'><div style='background:$sc;height:5px;border-radius:3px;width:${bar}px'></div></div></td><td><span class='badge' style='background:$sc;font-size:9px'>$topSev</span></td></tr>"
 }) -join "`n"
+
+# Truncate long AffectedObjects for HTML display only (CSV keeps full data)
+function Get-HtmlAO {
+    param([string]$raw, [int]$limit = 100)
+    $items = $raw -split ',\s*'
+    if ($items.Count -le $limit) { return [System.Net.WebUtility]::HtmlEncode($raw) }
+    $shown = ($items | Select-Object -First $limit) -join ', '
+    $rest  = $items.Count - $limit
+    return [System.Net.WebUtility]::HtmlEncode($shown) + " <span style='color:#6e6e80;font-size:10px'>... and $rest more objects (full list in CSV)</span>"
+}
 
 # Findings table rows
 $rows = foreach ($f in ($global:Findings | Sort-Object @{e={
@@ -1116,7 +1459,7 @@ $rows = foreach ($f in ($global:Findings | Sort-Object @{e={
     $rc  = [System.Net.WebUtility]::HtmlEncode($f.Recommendation)
     $ds  = [System.Net.WebUtility]::HtmlEncode($f.Description)
     $ch  = [System.Net.WebUtility]::HtmlEncode($f.Check)
-    $ao  = [System.Net.WebUtility]::HtmlEncode($f.AffectedObjects)
+    $ao  = Get-HtmlAO $f.AffectedObjects
     $cat = [System.Net.WebUtility]::HtmlEncode($f.Category)
     $ttp = [System.Net.WebUtility]::HtmlEncode($f.TTP)
     "<tr><td><span class='badge' style='background:$sc'>$($f.Severity)</span></td><td class='cat'>$cat</td>$(if($ttp){"<td><code class='ttp'>$ttp</code></td>"}else{'<td></td>'})<td class='chk'>$ch</td><td>$ds</td><td class='ao'>$ao</td><td class='mono'>$ev</td><td class='rec'>$rc</td></tr>"
@@ -1200,7 +1543,7 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
       <span class="sep">|</span>
       <span>Duration: $duration</span>
       <span class="sep">|</span>
-      <span>Checks: $(if($LiteMode){9}else{21})</span>
+      <span>Checks: $(if($LiteMode){9}else{22})</span>
     </div>
   </div>
   <div class="hdr-right">github.com/zavetsec<span>MITRE ATT&amp;CK | AD Security</span></div>
@@ -1232,7 +1575,7 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
     <div class="sc"><div class="n" style="color:#ff6b00">$highCount</div><div class="l">High</div></div>
     <div class="sc"><div class="n" style="color:#ffd60a">$medCount</div><div class="l">Medium</div></div>
     <div class="sc"><div class="n" style="color:#30d158">$lowCount</div><div class="l">Low</div></div>
-    <div class="sc"><div class="n" style="color:#a78bfa">$(if($LiteMode){9}else{21})</div><div class="l">Checks Run</div></div>
+    <div class="sc"><div class="n" style="color:#a78bfa">$(if($LiteMode){9}else{22})</div><div class="l">Checks Run</div></div>
     <div class="sc"><div class="n" style="color:#00d4ff">$totalCount</div><div class="l">Total Findings</div></div>
   </div>
 
@@ -1256,7 +1599,7 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
       </table>
     </div>
     <div class="panel">
-      <div class="panel-title">Checks Performed ($(if($LiteMode){'9 - LITE MODE'}else{'21 - FULL MODE'}))</div>
+      <div class="panel-title">Checks Performed ($(if($LiteMode){'9 - LITE MODE'}else{'22 - FULL MODE'}))</div>
       <table class="tbl-inner">
         <tbody>
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Domain Functional Level</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
@@ -1270,17 +1613,18 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
           <tr><td style="color:#6e6e80;font-size:11px">DCSync Rights</td><td style="color:#30d158;font-size:10px">Done</td></tr>
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Stale User Accounts</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Password Never Expires / Flags</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
-          $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>LAPS Deployment</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
+          $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>LAPS Deployment</td><td style='color:$(if($CheckLAPS){'#30d158'}else{'#6e6e80'});font-size:10px'>$(if($CheckLAPS){'Done'}else{'Skipped (-CheckLAPS)'})</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Stale Computer Accounts / EOL OS</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Domain Trusts</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
-          $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>GPO Security</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
+          $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>GPO Security (GPMC)</td><td style='color:#6e6e80;font-size:10px'>Optional (needs GPMC)</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Protected Users Group</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>Sensitive Account Flags</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>SIDHistory on Accounts</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           <tr><td style="color:#6e6e80;font-size:11px">GPP Passwords in SYSVOL (cpassword)</td><td style="color:#30d158;font-size:10px">Done</td></tr>
           <tr><td style="color:#6e6e80;font-size:11px">MachineAccountQuota</td><td style="color:#30d158;font-size:10px">Done</td></tr>
+          $(if(-not $LiteMode){"<tr><td style='color:#6e6e80;font-size:11px'>GPO Security Settings (SYSVOL)</td><td style='color:#30d158;font-size:10px'>Done</td></tr>"})
           <tr><td style="color:#6e6e80;font-size:11px">ACL Anomalies on Critical Objects</td><td style="color:#30d158;font-size:10px">Done</td></tr>
-          $(if($LiteMode){"<tr><td colspan='2' style='color:#ffd60a;font-size:10px;padding-top:8px'>12 checks skipped (use Full mode for complete audit)</td></tr>"})
+          $(if($LiteMode){"<tr><td colspan='2' style='color:#ffd60a;font-size:10px;padding-top:8px'>13 checks skipped (use Full mode for complete audit)</td></tr>"})
         </tbody>
       </table>
     </div>
