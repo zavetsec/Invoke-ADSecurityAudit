@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Invoke-ADSecurityAudit v1.2 | Build: FIX-001 | Encoding: UTF8-BOM-CRLF
+# Invoke-ADSecurityAudit v1.3 | Build: FIX-014 | Encoding: UTF8-NO-BOM
 <#
 .SYNOPSIS
     Invoke-ADSecurityAudit - Active Directory security audit.
@@ -36,7 +36,7 @@
 .PARAMETER OutputPath
     Path for HTML report. Default = Desktop.
 .PARAMETER CsvPath
-    Path for CSV findings export.
+    Path for TSV (tab-separated) findings export. Open with double-click in Excel - columns split automatically on any locale.
 .PARAMETER StaleAccountDays
     Days since last logon to consider account stale. Default = 90.
 .PARAMETER StaleComputerDays
@@ -54,7 +54,7 @@
     .\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local -StaleAccountDays 60
     .\Invoke-ADSecurityAudit.ps1 -LiteMode -Server dc01.corp.local
 .NOTES
-    Version : 1.2
+    Version : 1.3
     Requires: PowerShell 5.1+, RSAT AD module (ActiveDirectory), Domain read access.
     Install : Add-WindowsFeature RSAT-AD-PowerShell  (Server)
               Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools (Win10/11)
@@ -77,7 +77,7 @@ $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyI
 if (-not $scriptDir) { $scriptDir = (Get-Location).Path }
 $ts = Get-Date -Format 'yyyyMMdd_HHmmss'
 if (-not $OutputPath) { $OutputPath = Join-Path $scriptDir "ADSecurityAudit_$ts.html" }
-if (-not $CsvPath)    { $CsvPath    = Join-Path $scriptDir "ADSecurityAudit_$ts.csv"  }
+if (-not $CsvPath)    { $CsvPath    = Join-Path $scriptDir "ADSecurityAudit_$ts.tsv"  }
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
@@ -231,64 +231,81 @@ if ($domainFL -in $oldLevels) {
 # -------------------------------------------------------
 Write-Section "Check 2 - Privileged Group Membership"
 
-$privGroups = @(
-    'Domain Admins',
-    'Enterprise Admins',
-    'Schema Admins',
-    'Group Policy Creator Owners',
-    'Backup Operators',
-    'Account Operators',
-    'Server Operators',
-    'Print Operators',
-    'Remote Desktop Users',
-    'Administrators'
-)
+# Well-known SIDs for privileged groups - locale-independent (work on RU/EN/any Windows)
+# SID suffix is relative - prepend domain SID at runtime
+$privGroupSIDs = @{
+    'Domain Admins'              = '512'
+    'Enterprise Admins'          = '519'
+    'Schema Admins'              = '518'
+    'Group Policy Creator Owners'= '520'
+    'Backup Operators'           = '551'
+    'Account Operators'          = '548'
+    'Server Operators'           = '549'
+    'Print Operators'            = '550'
+    'Remote Desktop Users'       = '555'
+    'Administrators'             = '544'  # BUILTIN
+}
 
 $allPrivUsers = @{}
+$domainSID = (Get-ADDomain @adParams -EA Stop).DomainSID.Value
 
-foreach ($grpName in $privGroups) {
+foreach ($grpName in $privGroupSIDs.Keys) {
     try {
-        $grp = Get-ADGroup -Filter { Name -eq $grpName } @adParams -EA Stop
+        $rid = $privGroupSIDs[$grpName]
+        # BUILTIN groups use S-1-5-32-RID, domain groups use DomainSID-RID
+        # RID >= 512 and <= 520 are domain groups; 544,548-555 are BUILTIN groups
+        $sid = if ([int]$rid -ge 512 -and [int]$rid -le 521) {
+            "$domainSID-$rid"
+        } else {
+            "S-1-5-32-$rid"
+        }
+        $grp = Get-ADGroup -Identity $sid @adParams -EA Stop
         if (-not $grp) { continue }
+        $grpDisplayName = $grp.Name  # actual name in AD (may be Russian)
 
-        $members = Get-ADGroupMember -Identity $grp -Recursive @adParams -EA Stop |
-                   Where-Object { $_.objectClass -eq 'user' }
+        $members = @(Get-ADGroupMember -Identity $grp -Recursive @adParams -EA Stop |
+                   Where-Object { $_.objectClass -eq 'user' })
 
-        if ($members.Count -eq 0) { Write-Info "$grpName : empty - OK"; continue }
+        if ($members.Count -eq 0) { Write-Info "$grpDisplayName ($grpName) : empty - OK"; continue }
 
-        $memberDetails = foreach ($m in $members) {
+        $memberDetails = @(foreach ($m in $members) {
             try {
                 Get-ADUser -Identity $m.SamAccountName -Properties LastLogonDate,PasswordLastSet,Enabled,AdminCount @adParams -EA Stop
             } catch {}
-        }
+        })
 
-        $enabled   = ($memberDetails | Where-Object { $_.Enabled }).Count
-        $disabled  = ($memberDetails | Where-Object { -not $_.Enabled }).Count
-        $stale     = ($memberDetails | Where-Object { $_.Enabled -and $_.LastLogonDate -lt $staleDate -and $_.LastLogonDate }).Count
+        $enabled   = @($memberDetails | Where-Object { $_.Enabled }).Count
+        $disabled  = @($memberDetails | Where-Object { -not $_.Enabled }).Count
+        $stale     = @($memberDetails | Where-Object { $_.Enabled -and $_.LastLogonDate -lt $staleDate -and $_.LastLogonDate }).Count
         $names     = ($memberDetails | Select-Object -ExpandProperty SamAccountName) -join ', '
 
         # Flag: too many DA
-        $sev = 'INFO'
         if ($grpName -in @('Domain Admins','Enterprise Admins','Schema Admins') -and $enabled -gt 5) {
-            $sev = 'HIGH'
-            Add-Finding -Category 'Privileged Accounts' -Severity $sev -TTP 'T1078.002' `
-                -Check "Excessive $grpName Members" `
-                -Description "$grpName has $enabled enabled member(s) - should be minimal" `
+            Add-Finding -Category 'Privileged Accounts' -Severity 'HIGH' -TTP 'T1078.002' `
+                -Check "Excessive $grpDisplayName Members" `
+                -Description "$grpDisplayName ($grpName) has $enabled enabled member(s) - should be minimal" `
                 -AffectedObjects $names `
                 -Evidence "Enabled=$enabled Disabled=$disabled Stale=$stale" `
-                -Recommendation "Reduce $grpName membership to minimum necessary; use tiered administration model"
-        } elseif ($enabled -gt 0) {
-            Write-Info "$grpName : $enabled enabled member(s)"
+                -Recommendation "Reduce $grpDisplayName membership to minimum necessary; use tiered administration model"
+        } else {
+            Write-Info "$grpDisplayName ($grpName) : $enabled enabled, $disabled disabled member(s)"
         }
 
         # Flag: disabled accounts still in privileged groups
-        if ($disabled -gt 0) {
-            $disNames = ($memberDetails | Where-Object { -not $_.Enabled } | Select-Object -ExpandProperty SamAccountName) -join ', '
+        # Exclude built-in Administrator (SID ends in -500) - disabled by best practice
+        $disabledAccounts = @($memberDetails | Where-Object { -not $_.Enabled } | Where-Object {
+            try {
+                $sid = (New-Object System.Security.Principal.NTAccount($_.SamAccountName)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                $sid -notmatch '-500$'
+            } catch { $true }
+        })
+        if ($disabledAccounts.Count -gt 0) {
+            $disNames = ($disabledAccounts | Select-Object -ExpandProperty SamAccountName) -join ', '
             Add-Finding -Category 'Privileged Accounts' -Severity 'MEDIUM' -TTP 'T1078.002' `
-                -Check "Disabled Accounts in $grpName" `
-                -Description "$disabled disabled account(s) still present in $grpName" `
+                -Check "Disabled Accounts in $grpDisplayName" `
+                -Description "$($disabledAccounts.Count) disabled account(s) still present in $grpDisplayName ($grpName)" `
                 -AffectedObjects $disNames `
-                -Evidence "Group=$grpName DisabledCount=$disabled" `
+                -Evidence "Group=$grpDisplayName DisabledCount=$($disabledAccounts.Count)" `
                 -Recommendation 'Remove disabled accounts from privileged groups immediately'
         }
 
@@ -297,16 +314,16 @@ foreach ($grpName in $privGroups) {
             $staleNames = ($memberDetails | Where-Object { $_.Enabled -and $_.LastLogonDate -lt $staleDate -and $_.LastLogonDate } |
                           Select-Object -ExpandProperty SamAccountName) -join ', '
             Add-Finding -Category 'Privileged Accounts' -Severity 'HIGH' -TTP 'T1078.002' `
-                -Check "Stale Accounts in $grpName" `
-                -Description "$stale stale account(s) in $grpName (no logon for $StaleAccountDays+ days)" `
+                -Check "Stale Accounts in $grpDisplayName" `
+                -Description "$stale stale account(s) in $grpDisplayName ($grpName) (no logon for $StaleAccountDays+ days)" `
                 -AffectedObjects $staleNames `
-                -Evidence "Group=$grpName StaleCount=$stale ThresholdDays=$StaleAccountDays" `
+                -Evidence "Group=$grpDisplayName StaleCount=$stale ThresholdDays=$StaleAccountDays" `
                 -Recommendation 'Review and remove stale privileged accounts; enforce periodic access review'
         }
 
-        foreach ($m in $memberDetails) { $allPrivUsers[$m.SamAccountName] = $grpName }
+        foreach ($m in $memberDetails) { $allPrivUsers[$m.SamAccountName] = $grpDisplayName }
 
-    } catch { Write-Warn "Could not query group: $grpName - $_" }
+    } catch { Write-Warn "Could not query group: $grpName (SID=$sid) - $_" }
 }
 
 # -------------------------------------------------------
@@ -430,7 +447,7 @@ try {
                 -Check 'Kerberoastable Account' `
                 -Description "Account '$($acct.SamAccountName)' has SPN(s) - subject to Kerberoasting$tag" `
                 -AffectedObjects $acct.SamAccountName `
-                -Evidence "SPN=$spns PwdAge=${pwdAge}d LastLogon=$($acct.LastLogonDate) AdminCount=$($acct.AdminCount)" `
+                -Evidence "SPN=$spns PwdAge=${pwdAge}d LastLogon=$($acct.LastLogonDate) AdminCount=$(if($acct.AdminCount -eq 1){1}else{0})" `
                 -Recommendation 'Use strong passwords (25+ chars) for service accounts; prefer gMSA; enforce AES-256 encryption on SPNs'
         }
         Write-Info "Kerberoastable accounts: $($kerbAccounts.Count)"
@@ -564,14 +581,36 @@ try {
         '89e95b76-444d-4c62-991a-0facbeda640c'
     )
 
+    # Legitimate SIDs for DCSync: Domain Controllers, Enterprise DCs, Domain Admins,
+    # Enterprise Admins, Administrators, SYSTEM, Local System
+    $dcSyncLegitSIDs = @(
+        "$domainSID-512", "$domainSID-516", "$domainSID-519",
+        'S-1-5-32-544', 'S-1-5-9', 'S-1-5-18', 'S-1-5-32-548'
+    )
+
     $dcSyncAccounts = @()
     foreach ($ace in $domainACL.Access) {
         if ($ace.ActiveDirectoryRights -match 'ExtendedRight' -and
-            $ace.AccessControlType -eq 'Allow' -and
-            $ace.IdentityReference -notmatch '(Domain Controllers|Enterprise Domain Controllers|SYSTEM|Domain Admins|Enterprise Admins|Administrators|Контроллеры домена|Администраторы|КОНТРОЛЛЕРЫ ДОМЕНА|NT AUTHORITY\\ENTERPRISE|NT AUTHORITY\\КОНТРОЛЛЕРЫ)') {
+            $ace.AccessControlType -eq 'Allow') {
 
             $guidStr = $ace.ObjectType.ToString().ToLower()
-            if ($guidStr -in $dcSyncGuids) {
+            if ($guidStr -notin $dcSyncGuids) { continue }
+
+            # Resolve identity to SID for locale-independent check
+            $aceIsLegit = $false
+            try {
+                $aceSID = (New-Object System.Security.Principal.NTAccount($ace.IdentityReference.ToString())).Translate([System.Security.Principal.SecurityIdentifier]).Value
+                foreach ($ls in $dcSyncLegitSIDs) {
+                    if ($aceSID -eq $ls -or $aceSID.StartsWith("$domainSID-5")) { $aceIsLegit = $true; break }
+                }
+                # Also allow any account whose SID starts with S-1-5-9 (Enterprise DCs) or is a well-known DC SID
+                if ($aceSID -eq 'S-1-5-9') { $aceIsLegit = $true }
+            } catch {
+                # Cannot resolve - apply string fallback for NT AUTHORITY and BUILTIN
+                $idStr = $ace.IdentityReference.ToString()
+                if ($idStr -match 'NT AUTHORITY|BUILTIN\\Administrators|S-1-5-') { $aceIsLegit = $true }
+            }
+            if (-not $aceIsLegit) {
                 $dcSyncAccounts += $ace.IdentityReference.ToString()
             }
         }
@@ -689,7 +728,7 @@ try {
         $names = ($desUsers | Select-Object -ExpandProperty SamAccountName) -join ', '
         Add-Finding -Category 'Kerberos' -Severity 'HIGH' `
             -Check 'DES Encryption Enabled' `
-            -Description "$($desUsers.Count) account(s) have DES Kerberos encryption enabled (weak, deprecated)" `
+            -Description "$($desUsers.Count) account(s) have DES Kerberos encryption enabled - weak and deprecated" `
             -AffectedObjects $names `
             -Evidence "Accounts=$names" `
             -Recommendation 'Disable UseDESKeyOnly; require AES-256 Kerberos encryption'
@@ -724,16 +763,16 @@ try {
         $sev = if ($pct -lt 50) { 'HIGH' } else { 'MEDIUM' }
         Add-Finding -Category 'Local Admin' -Severity $sev `
             -Check 'LAPS Partial Deployment' `
-            -Description "LAPS deployed on $withLAPS/$totalComp computers ($pct%); $withoutLAPS computer(s) without LAPS" `
+            -Description "LAPS deployed on $withLAPS/$totalComp computers (coverage ${pct}pct); $withoutLAPS computer(s) without LAPS" `
             -AffectedObjects "$withoutLAPS computers without LAPS" `
-            -Evidence "WithLAPS=$withLAPS WithoutLAPS=$withoutLAPS Coverage=$pct%" `
+            -Evidence "WithLAPS=$withLAPS WithoutLAPS=$withoutLAPS Coverage=${pct}pct" `
             -Recommendation 'Complete LAPS deployment to all Windows endpoints'
     } else {
         Write-Info "LAPS deployed on all $totalComp computers - OK"
     }
 } catch { Write-Warn "Cannot query LAPS status (attribute may not exist): $_" }
 } else {
-    Write-Section "Check 12 - LAPS (skipped, use -CheckLAPS to enable)"
+    Write-Section "Check 12 - LAPS skipped; use -CheckLAPS to enable"
     Write-Info "LAPS check skipped - add -CheckLAPS switch to include"
 }
 
@@ -964,7 +1003,7 @@ try {
         foreach ($f in $gppFiles) {
             try {
                 $content = Get-Content $f.FullName -Raw -ErrorAction Stop
-                if ($content -match 'cpassword="([^"]+)"') {
+                if ($content -match 'cpassword=.([^"]+).') {
                     $hitFiles += $f.FullName
                     $userName = if ($content -match 'userName="([^"]+)"') { $Matches[1] } else { 'unknown' }
                     Add-Finding -Category 'GPP Credentials' -Severity 'CRITICAL' -TTP 'T1552.006' `
@@ -978,7 +1017,7 @@ try {
         }
 
         if ($hitFiles.Count -eq 0) {
-            Write-Info "No GPP cpassword found in SYSVOL ($($gppFiles.Count) policy files scanned) - OK"
+            Write-Info "No GPP cpassword found in SYSVOL - $($gppFiles.Count) policy files scanned - OK"
         }
     } else {
         Write-Warn "Cannot access SYSVOL at $sysvolPath - skipping GPP check"
@@ -1312,18 +1351,19 @@ $dangerousRights = @(
 )
 
 # Principals always allowed to have these rights
-$legitimatePrincipals = @(
-    'Domain Admins',
-    'Enterprise Admins',
-    'Schema Admins',
-    'Administrators',
-    'SYSTEM',
-    'Creator Owner',
-    'ENTERPRISE DOMAIN CONTROLLERS',
-    'NT AUTHORITY\SYSTEM',
-    'NT AUTHORITY\ENTERPRISE DOMAIN CONTROLLERS',
-    'Account Operators',
-    'BUILTIN\Administrators'
+# Legitimate principal SIDs - locale-independent
+# Domain groups: DomainSID-RID; BUILTIN groups: S-1-5-32-RID; NT AUTHORITY: fixed SIDs
+$legitimateSIDs = @(
+    "$domainSID-512",   # Domain Admins
+    "$domainSID-519",   # Enterprise Admins
+    "$domainSID-518",   # Schema Admins
+    "$domainSID-516",   # Domain Controllers
+    "$domainSID-498",   # Enterprise Read-Only Domain Controllers
+    'S-1-5-32-544',     # BUILTIN\Administrators
+    'S-1-5-32-548',     # Account Operators
+    'S-1-5-9',          # Enterprise Domain Controllers
+    'S-1-5-18',         # SYSTEM / Local System
+    'S-1-3-0'           # Creator Owner
 )
 
 function Test-ACLAnomalies {
@@ -1335,10 +1375,17 @@ function Test-ACLAnomalies {
             if ($ace.AccessControlType -ne 'Allow') { continue }
             $id = $ace.IdentityReference.ToString()
 
-            # Skip well-known legitimate principals
+            # Resolve to SID for locale-independent comparison
             $isLegit = $false
-            foreach ($lp in $legitimatePrincipals) {
-                if ($id -match [Regex]::Escape($lp)) { $isLegit = $true; break }
+            try {
+                $ntAccount = New-Object System.Security.Principal.NTAccount($id)
+                $resolvedSID = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
+                foreach ($ls in $legitimateSIDs) {
+                    if ($resolvedSID -eq $ls -or $resolvedSID.StartsWith($ls)) { $isLegit = $true; break }
+                }
+            } catch {
+                # SID resolution failed (e.g. orphaned SID) - treat as non-legitimate
+                $isLegit = $false
             }
             if ($isLegit) { continue }
 
@@ -1352,10 +1399,11 @@ function Test-ACLAnomalies {
             }
         }
         if ($hits.Count -gt 0) {
-            $unique = ($hits | Sort-Object -Unique) -join ' | '
+            $uniqueArr = @($hits | Sort-Object -Unique)
+            $unique = $uniqueArr -join ' | '
             Add-Finding -Category 'ACL Anomaly' -Severity 'CRITICAL' -TTP 'T1222.001' `
                 -Check "Dangerous ACE on $ObjectLabel" `
-                -Description "$($hits.Count) non-standard principal(s) have dangerous rights on '$ObjectLabel'" `
+                -Description "$($uniqueArr.Count) non-standard principal(s) have dangerous rights on '$ObjectLabel'" `
                 -AffectedObjects $unique `
                 -Evidence "Target=$TargetDN Rights=$unique" `
                 -Recommendation "CRITICAL: Review and remove dangerous ACEs from '$ObjectLabel'; use AD ACL Scanner or Get-ACL to audit; grant only minimum required permissions"
@@ -1376,16 +1424,7 @@ Test-ACLAnomalies -TargetDN $adminSDHolderDN -ObjectLabel 'AdminSDHolder'
 $dcOuDN = "OU=Domain Controllers,$domainDN"
 Test-ACLAnomalies -TargetDN $dcOuDN -ObjectLabel 'Domain Controllers OU'
 
-# Check all privileged user accounts ACLs
-$checkedPrivCount = 0
-foreach ($samName in ($allPrivUsers.Keys | Select-Object -First 10)) {
-    try {
-        $privUser = Get-ADUser -Identity $samName -Properties DistinguishedName @adParams -EA Stop
-        Test-ACLAnomalies -TargetDN $privUser.DistinguishedName -ObjectLabel "Privileged User: $samName"
-        $checkedPrivCount++
-    } catch {}
-}
-Write-Info "ACL check on domain root, AdminSDHolder, DC OU and $checkedPrivCount privileged user objects complete"
+Write-Info "ACL check on domain root, AdminSDHolder and DC OU complete"
 
 # -------------------------------------------------------
 # SUMMARY STATS
@@ -1410,9 +1449,15 @@ $riskColor  = switch ($riskLevel) {
 # -------------------------------------------------------
 # CSV EXPORT
 # -------------------------------------------------------
-Write-Section "Exporting CSV"
-$global:Findings | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-Write-Info "CSV: $CsvPath"
+Write-Section "Exporting TSV"
+$utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+# Export as comma-separated CSV with UTF-8 BOM.
+# BOM tells Excel to read as UTF-8 (fixes cyrillic on Russian Windows).
+# Open via File > Open in Excel - do NOT use Text-to-Columns (ignores RFC-4180 quoting).
+$utf8Bom = [System.Text.UTF8Encoding]::new($true)
+$csvContent = $global:Findings | ConvertTo-Csv -NoTypeInformation -Delimiter "`t"
+[System.IO.File]::WriteAllLines($CsvPath, $csvContent, $utf8Bom)
+Write-Info "TSV: $CsvPath"
 
 # -------------------------------------------------------
 # HTML REPORT
@@ -1443,11 +1488,11 @@ $catRows = ($catSummary | ForEach-Object {
 # Truncate long AffectedObjects for HTML display only (CSV keeps full data)
 function Get-HtmlAO {
     param([string]$raw, [int]$limit = 100)
-    $items = $raw -split ',\s*'
+    $items = $raw -split ', *'
     if ($items.Count -le $limit) { return [System.Net.WebUtility]::HtmlEncode($raw) }
     $shown = ($items | Select-Object -First $limit) -join ', '
     $rest  = $items.Count - $limit
-    return [System.Net.WebUtility]::HtmlEncode($shown) + " <span style='color:#6e6e80;font-size:10px'>... and $rest more objects (full list in CSV)</span>"
+    return [System.Net.WebUtility]::HtmlEncode($shown) + " <span style='color:#6e6e80;font-size:10px'>... and $rest more objects (full list in TSV)</span>"
 }
 
 # Findings table rows
@@ -1478,58 +1523,58 @@ $html = @"
 <title>AD Security Audit - $($domain.DNSRoot)</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#07070e;color:#e2e2e8;font-family:'Segoe UI',system-ui,sans-serif;font-size:13px;line-height:1.6}
+body{background:#07070e;color:#e2e2e8;font-family:'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.6}
 header{background:#0a0a12;border-bottom:1px solid #181828;padding:10px 32px;display:flex;align-items:center;justify-content:space-between;gap:16px}
 .hdr-left{display:flex;flex-direction:column;gap:3px}
-.hdr-title{font-size:15px;font-weight:800;color:#e2e2e8;font-family:'Courier New',monospace;letter-spacing:-0.3px}
+.hdr-title{font-size:16px;font-weight:800;color:#e2e2e8;font-family:'Courier New',monospace;letter-spacing:-0.3px}
 .hdr-title span{color:#00d4ff}
 .hdr-title em{color:#6e6e80;font-style:normal;font-size:12px;font-weight:400;margin-left:6px}
-.hdr-meta{font-size:11px;color:#6e6e80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.hdr-meta{font-size:12px;color:#6e6e80;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .hdr-meta .sep{color:#282838}
-.hdr-mode{background:#00d4ff;color:#07070e;font-size:10px;font-weight:700;padding:1px 7px;border-radius:3px;letter-spacing:.4px}
+.hdr-mode{background:#00d4ff;color:#07070e;font-size:11px;font-weight:700;padding:1px 7px;border-radius:3px;letter-spacing:.4px}
 .hdr-mode.lite{background:#ffd60a;color:#07070e}
-.hdr-right{text-align:right;font-size:11px;color:#00d4ff;font-family:'Courier New',monospace;white-space:nowrap}
-.hdr-right span{display:block;color:#6e6e80;font-size:10px;margin-top:2px}
+.hdr-right{text-align:right;font-size:12px;color:#00d4ff;font-family:'Courier New',monospace;white-space:nowrap}
+.hdr-right span{display:block;color:#6e6e80;font-size:11px;margin-top:2px}
 .main{padding:26px 40px;max-width:1700px;margin:0 auto}
 .rb{background:#0e0e1a;border:2px solid $riskColor;border-radius:12px;padding:18px 26px;margin-bottom:22px;display:flex;align-items:center;gap:28px}
-.rl{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:1.2px}
+.rl{font-size:11px;color:#6e6e80;text-transform:uppercase;letter-spacing:1.2px}
 .rv{font-size:28px;font-weight:900;color:$riskColor;letter-spacing:-1px}
 .score{font-size:42px;font-weight:900;font-family:'Courier New',monospace;color:$scoreColor}
-.score-label{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+.score-label{font-size:11px;color:#6e6e80;text-transform:uppercase;letter-spacing:1px;margin-top:2px}
 .stats{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}
 .sc{background:#0e0e1a;border:1px solid #181828;border-radius:10px;padding:14px 16px}
 .sc .n{font-size:26px;font-weight:800;font-family:'Courier New',monospace}
-.sc .l{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:.8px;margin-top:3px}
+.sc .l{font-size:11px;color:#6e6e80;text-transform:uppercase;letter-spacing:.8px;margin-top:3px}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:22px}
 .dominfo{background:#0e0e1a;border:1px solid #181828;border-radius:10px;padding:16px 20px;margin-bottom:22px;display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.di .k{font-size:10px;color:#6e6e80;text-transform:uppercase;letter-spacing:.8px}
-.di .v{font-size:12px;font-family:'Courier New',monospace;margin-top:2px;color:#e2e2e8}
+.di .k{font-size:11px;color:#6e6e80;text-transform:uppercase;letter-spacing:.8px}
+.di .v{font-size:13px;font-family:'Courier New',monospace;margin-top:2px;color:#e2e2e8}
 .panel{background:#0e0e1a;border:1px solid #181828;border-radius:10px;padding:14px 18px}
-.panel-title{font-size:10px;font-weight:700;color:#6e6e80;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #181828}
-.st{font-size:11px;font-weight:700;color:#00d4ff;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #181828;margin-top:22px}
-table{width:100%;border-collapse:collapse;background:#0e0e1a;border-radius:10px;overflow:hidden;border:1px solid #181828;font-size:12px}
-.tbl-inner{width:100%;border-collapse:collapse;font-size:11px}
-th{background:#08081a;color:#6e6e80;font-size:9px;text-transform:uppercase;letter-spacing:1px;padding:9px 12px;text-align:left;font-weight:700;white-space:nowrap}
+.panel-title{font-size:11px;font-weight:700;color:#6e6e80;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #181828}
+.st{font-size:12px;font-weight:700;color:#00d4ff;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid #181828;margin-top:22px}
+table{width:100%;border-collapse:collapse;background:#0e0e1a;border-radius:10px;overflow:hidden;border:1px solid #181828;font-size:13px}
+.tbl-inner{width:100%;border-collapse:collapse;font-size:12px}
+th{background:#08081a;color:#6e6e80;font-size:10px;text-transform:uppercase;letter-spacing:1px;padding:9px 12px;text-align:left;font-weight:700;white-space:nowrap}
 td{padding:8px 12px;border-top:1px solid #181828;vertical-align:top}
 tr:hover td{background:#08081a}
-.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;letter-spacing:.5px;color:#fff;white-space:nowrap}
-.ttp{background:#181828;color:#00d4ff;padding:2px 6px;border-radius:4px;font-size:10px;font-family:'Courier New',monospace;white-space:nowrap}
-.cat{color:#a78bfa;font-size:11px;white-space:nowrap}
-.chk{color:#ffd60a;font-size:11px}
-.ao{font-family:'Courier New',monospace;font-size:10px;color:#ff6b00;max-width:200px;word-break:break-all}
-.mono{font-family:'Courier New',monospace;font-size:10px;color:#6e6e80;word-break:break-all;max-width:200px}
-.rec{color:#7eb8ff;font-size:11px;max-width:220px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:700;letter-spacing:.5px;color:#fff;white-space:nowrap}
+.ttp{background:#181828;color:#00d4ff;padding:2px 6px;border-radius:4px;font-size:11px;font-family:'Courier New',monospace;white-space:nowrap}
+.cat{color:#a78bfa;font-size:12px;white-space:nowrap}
+.chk{color:#ffd60a;font-size:12px}
+.ao{font-family:'Courier New',monospace;font-size:11px;color:#ff6b00;max-width:200px;word-break:break-all}
+.mono{font-family:'Courier New',monospace;font-size:11px;color:#6e6e80;word-break:break-all;max-width:200px}
+.rec{color:#7eb8ff;font-size:12px;max-width:220px}
 .search-bar{background:#0e0e1a;border:1px solid #181828;border-radius:8px;padding:10px 14px;margin-bottom:12px;display:flex;gap:10px;align-items:center}
-.search-bar input{background:#07070e;border:1px solid #282838;border-radius:6px;color:#e2e2e8;padding:6px 12px;font-size:12px;flex:1;outline:none}
-.filter-btn{background:#181828;border:1px solid #282838;border-radius:6px;color:#a0a0c0;padding:5px 12px;font-size:11px;cursor:pointer}
+.search-bar input{background:#07070e;border:1px solid #282838;border-radius:6px;color:#e2e2e8;padding:6px 12px;font-size:13px;flex:1;outline:none}
+.filter-btn{background:#181828;border:1px solid #282838;border-radius:6px;color:#a0a0c0;padding:5px 12px;font-size:12px;cursor:pointer}
 .filter-btn:hover{background:#282838}
-footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6e80;font-size:11px;text-align:center}
+footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6e80;font-size:12px;text-align:center}
 </style>
 </head>
 <body>
 <header>
   <div class="hdr-left">
-    <div class="hdr-title">ZavetSec<span>-ADSecurityAudit</span><em>v1.2</em></div>
+    <div class="hdr-title">ZavetSec<span>-ADSecurityAudit</span><em>v1.3</em></div>
     <div class="hdr-meta">
       <span>Active Directory Security Audit</span>
       <span class="sep">|</span>
@@ -1665,13 +1710,13 @@ function setFilter(v) {
 }
 </script>
 <footer>
-  Generated: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | Invoke-ADSecurityAudit v1.2 $(if($LiteMode){'[LITE]'}else{'[FULL]'}) | Domain: $($domain.DNSRoot) | CONFIDENTIAL - SOC/IS USE ONLY
+  Generated: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | Invoke-ADSecurityAudit v1.3 $(if($LiteMode){'[LITE]'}else{'[FULL]'}) | Domain: $($domain.DNSRoot) | CONFIDENTIAL - SOC/IS USE ONLY
 </footer>
 </body>
 </html>
 "@
 
-$html | Out-File -FilePath $OutputPath -Encoding UTF8 -Force
+[System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.UTF8Encoding]::new($false))
 
 $sep = "-" * 62
 Write-Host ""; Write-Host $sep -ForegroundColor DarkGray
@@ -1697,7 +1742,7 @@ if ($totalCount -gt 0) {
     Write-Host ""
 }
 Write-Host "  HTML : $OutputPath" -ForegroundColor Cyan
-Write-Host "  CSV  : $CsvPath"    -ForegroundColor Cyan
+Write-Host "  TSV  : $CsvPath"    -ForegroundColor Cyan
 Write-Host $sep -ForegroundColor DarkGray
 
 $open = Read-Host "Open HTML report in browser? [Y/N]"
