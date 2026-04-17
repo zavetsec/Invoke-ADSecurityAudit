@@ -14,7 +14,7 @@ Single-file PowerShell script. Run it on a domain-joined machine and get a struc
 
 ## Preview (html report)
 
-<img width="1481" height="813" alt="image" src="https://github.com/user-attachments/assets/ddc967e6-b15b-4ef4-9d86-fc1ee9151690" />
+<img width="1653" height="809" alt="image" src="https://github.com/user-attachments/assets/ed1ad918-2117-4a48-9dd0-8727f22f5400" />
 
 ---
 
