@@ -1,5 +1,5 @@
 #Requires -Version 5.1
-# Invoke-ADSecurityAudit v1.3 | Build: FIX-014 | Encoding: UTF8-NO-BOM
+# Invoke-ADSecurityAudit v1.2 | Build: FIX-014 | Encoding: UTF8-NO-BOM
 <#
 .SYNOPSIS
     Invoke-ADSecurityAudit - Active Directory security audit.
@@ -54,7 +54,7 @@
     .\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local -StaleAccountDays 60
     .\Invoke-ADSecurityAudit.ps1 -LiteMode -Server dc01.corp.local
 .NOTES
-    Version : 1.3
+    Version : 1.2
     Requires: PowerShell 5.1+, RSAT AD module (ActiveDirectory), Domain read access.
     Install : Add-WindowsFeature RSAT-AD-PowerShell  (Server)
               Add-WindowsCapability -Online -Name Rsat.ActiveDirectory.DS-LDS.Tools (Win10/11)
@@ -1574,7 +1574,7 @@ footer{margin-top:32px;padding:16px 40px;border-top:1px solid #181828;color:#6e6
 <body>
 <header>
   <div class="hdr-left">
-    <div class="hdr-title">ZavetSec<span>-ADSecurityAudit</span><em>v1.3</em></div>
+    <div class="hdr-title">ZavetSec<span>-ADSecurityAudit</span><em>v1.2</em></div>
     <div class="hdr-meta">
       <span>Active Directory Security Audit</span>
       <span class="sep">|</span>
@@ -1710,7 +1710,7 @@ function setFilter(v) {
 }
 </script>
 <footer>
-  Generated: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | Invoke-ADSecurityAudit v1.3 $(if($LiteMode){'[LITE]'}else{'[FULL]'}) | Domain: $($domain.DNSRoot) | CONFIDENTIAL - SOC/IS USE ONLY
+  Generated: $($global:StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | Invoke-ADSecurityAudit v1.2 $(if($LiteMode){'[LITE]'}else{'[FULL]'}) | Domain: $($domain.DNSRoot) | CONFIDENTIAL - SOC/IS USE ONLY
 </footer>
 </body>
 </html>
