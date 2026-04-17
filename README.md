@@ -39,7 +39,7 @@ Single-file PowerShell script. Run it on a domain-joined machine and get a struc
 - Checks for misconfigurations that are **frequently exploited or create high-impact attack conditions**
 - Maps every finding to MITRE ATT&CK where applicable
 - Reads GPO security settings directly from SYSVOL — no GPMC required
-- Produces a self-contained HTML report + structured CSV
+- Produces a self-contained HTML report + structured TSV
 
 **Does not:**
 - Enumerate attack paths or graph-based lateral movement chains (use BloodHound for that)
@@ -66,7 +66,7 @@ Severity is based on simple, documented thresholds (password age, group membersh
 - **Read-only** — only LDAP reads, SYSVOL file reads, and `Get-ACL` calls. No `Set-AD*`, `New-AD*`, `Remove-AD*`, no RPC execution, no WMI, no PowerShell Remoting
 - **Graceful degradation** — missing permissions or modules produce console warnings, not crashes
 - **Consistent output** — same environment always produces the same findings; no randomness or sampling
-- **Full data** — complete object lists in CSV; HTML truncates to 100 objects per finding for performance
+- **Full data** — complete object lists in TSV; HTML truncates to 100 objects per finding for performance
 
 ---
 
@@ -113,7 +113,7 @@ cd Invoke-ADSecurityAudit
 
 <img width="1285" height="832" alt="Снимок" src="https://github.com/user-attachments/assets/d7e3dfa9-ea31-498c-beaf-e50cab666d88" />
 
-Reports are saved to the script directory as `ADSecurityAudit_<timestamp>.html` and `.csv`.
+Reports are saved to the script directory as `ADSecurityAudit_<timestamp>.html` and `.tsv`.
 
 ---
 
@@ -222,7 +222,7 @@ Checks **2, 3, 5, 6, 7, 9, 19, 20, 21**. Covers Golden Ticket, Kerberoasting, AS
 | `-Server` | String | PDC Emulator | DC FQDN or IP. Required when running from a non-domain machine |
 | `-Credential` | PSCredential | Current user | Explicit credentials for non-domain or cross-domain runs |
 | `-OutputPath` | String | Script dir | Full path for HTML report |
-| `-CsvPath` | String | Script dir | Full path for CSV export |
+| `-CsvPath` | String | Script dir | Full path for TSV export |
 | `-StaleAccountDays` | Int | 90 | Logon inactivity threshold for user accounts |
 | `-StaleComputerDays` | Int | 90 | Logon inactivity threshold for computer accounts |
 | `-LiteMode` | Switch | Off | Run 9 critical checks only |
