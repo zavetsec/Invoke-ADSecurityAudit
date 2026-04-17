@@ -111,7 +111,7 @@ cd Invoke-ADSecurityAudit
 .\Invoke-ADSecurityAudit.ps1 -Server dc01.corp.local -Credential (Get-Credential)
 ```
 
-<img width="1285" height="832" alt="Снимок" src="https://github.com/user-attachments/assets/d7e3dfa9-ea31-498c-beaf-e50cab666d88" />
+<img width="1285" height="832" alt="Снимок" src="https://github.com/user-attachments/assets/e1261405-8c78-4654-8119-c918441ca49f" />
 
 Reports are saved to the script directory as `ADSecurityAudit_<timestamp>.html` and `.tsv`.
 
