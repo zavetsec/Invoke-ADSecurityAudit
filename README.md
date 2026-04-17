@@ -14,9 +14,8 @@ Single-file PowerShell script. Run it on a domain-joined machine and get a struc
 
 ## Preview
 
-![HTML Report — risk overview and findings table](docs/report.png)
+111
 
-![Severity filtering and MITRE ATT&CK mapping](docs/report-filter.png)
 
 ---
 
@@ -38,7 +37,7 @@ Single-file PowerShell script. Run it on a domain-joined machine and get a struc
 ## What this tool does and does not do
 
 **Does:**
-- Checks for actively-exploited misconfigurations across 22 categories
+- Checks for misconfigurations that are **frequently exploited or create high-impact attack conditions**
 - Maps every finding to MITRE ATT&CK where applicable
 - Reads GPO security settings directly from SYSVOL — no GPMC required
 - Produces a self-contained HTML report + structured CSV
@@ -74,7 +73,7 @@ Severity is based on simple, documented thresholds (password age, group membersh
 
 ## How it works
 
-- **LDAP queries** via the RSAT `ActiveDirectory` module — server-side filtered, no full object dumps
+- **LDAP queries** via the RSAT `ActiveDirectory` module — server-side filtered where possible, avoids unnecessary full-domain enumeration
 - **SYSVOL reads** over SMB for GPP password scanning (Check 19) and GPO security settings (Check 22)
 - **ACL inspection** via `Get-ACL` on specific AD object paths — domain root, AdminSDHolder, DC OU, and up to 10 privileged user objects
 - **No RPC execution, no WMI, no PowerShell Remoting** — all data collection is passive read-only
@@ -82,6 +81,8 @@ Severity is based on simple, documented thresholds (password age, group membersh
 ---
 
 
+
+## Use cases
 
 - **Incident response triage** — quickly surface the highest-risk misconfigurations before going deeper
 - **Pre-pentest baseline** — document the state of the domain before a red team engagement
@@ -97,6 +98,9 @@ Severity is based on simple, documented thresholds (password age, group membersh
 # Clone
 git clone https://github.com/zavetsec/Invoke-ADSecurityAudit
 cd Invoke-ADSecurityAudit
+
+# Or download the script directly and run from its directory
+# https://github.com/zavetsec/Invoke-ADSecurityAudit/raw/main/Invoke-ADSecurityAudit.ps1
 
 # Full audit — auto-detect PDC, save report to script directory
 .\Invoke-ADSecurityAudit.ps1
@@ -189,7 +193,7 @@ Check 15 is the only check requiring GPMC. If absent it is silently skipped. Che
 | 21 | ACL anomalies on domain root, AdminSDHolder, DC OU | CRITICAL | [T1222.001](https://attack.mitre.org/techniques/T1222/001/) | Needs DA |
 | 22 | GPO security settings via SYSVOL (no GPMC required) | CRITICAL–MEDIUM | Multiple | |
 
-**Check 22 — GPO security settings** reads `GptTmpl.inf` and `Registry.xml` from every GPO in SYSVOL and checks for specific high-risk settings:
+**Check 22 — GPO security settings** reads `GptTmpl.inf` and `Registry.xml` from every GPO in SYSVOL and performs pattern-based checks for specific high-risk settings:
 
 | Setting checked | Finding if... | MITRE |
 |---|---|---|
